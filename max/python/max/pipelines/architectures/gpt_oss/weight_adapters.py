@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import os
 from collections import defaultdict
 
 import numpy as np
@@ -60,16 +59,13 @@ def _as_numpy(value: object) -> np.ndarray:
     return np.asarray(value)
 
 
-def _convert_blocks_to_qe(
-    blocks: np.ndarray, scales: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
+def _convert_blocks_to_qe(blocks: np.ndarray, scales: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Convert MXFP4 block/scales tensors to packed Q/E layout."""
     blocks_np = np.asarray(blocks, dtype=np.uint8)
     scales_np = np.asarray(scales, dtype=np.uint8)
     if blocks_np.shape[-1] != 16:
         raise ValueError(
-            "Expected MXFP4 blocks to have trailing dimension 16, got"
-            f" {blocks_np.shape}."
+            f"Expected MXFP4 blocks to have trailing dimension 16, got {blocks_np.shape}."
         )
     prefix = blocks_np.shape[:-2]
     group = blocks_np.shape[-2]
@@ -112,15 +108,13 @@ def convert_safetensor_state_dict(
 
     for base, tensors in pending_mxfp4.items():
         if "blocks" not in tensors or "scales" not in tensors:
-            raise ValueError(
-                f"Incomplete MXFP4 tensor for '{base}': found {list(tensors.keys())}"
-            )
+            raise ValueError(f"Incomplete MXFP4 tensor for '{base}': found {list(tensors.keys())}")
         q, e = _convert_blocks_to_qe(tensors["blocks"], tensors["scales"])
-        new_state[f\"{base}.q\"] = WeightData.from_numpy(
-            np.ascontiguousarray(q, dtype=np.uint8), f\"{base}.q\"
+        new_state[f"{base}.q"] = WeightData.from_numpy(
+            np.ascontiguousarray(q, dtype=np.uint8), f"{base}.q"
         )
-        new_state[f\"{base}.e\"] = WeightData.from_numpy(
-            np.ascontiguousarray(e, dtype=np.uint8), f\"{base}.e\"
+        new_state[f"{base}.e"] = WeightData.from_numpy(
+            np.ascontiguousarray(e, dtype=np.uint8), f"{base}.e"
         )
 
     return new_state
