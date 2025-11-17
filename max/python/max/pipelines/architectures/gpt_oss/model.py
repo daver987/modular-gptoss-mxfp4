@@ -57,6 +57,21 @@ from .model_config import GptOssConfig
 logger = logging.getLogger("max.pipelines")
 
 
+def _supports_mxfp4(layer: object) -> bool:
+    return hasattr(layer, "enable_mxfp4") and hasattr(layer, "_has_mxfp4_weights")
+
+
+def _should_enable_mxfp4(
+    state_dict: dict[str, object], encoding: SupportedEncoding
+) -> bool:
+    if encoding == SupportedEncoding.mxfp4:
+        return True
+    return any(
+        name.endswith(".weight.q") or name.endswith(".weight.e")
+        for name in state_dict.keys()
+    )
+
+
 class GptOssInputs(ModelInputs):
     """A class representing inputs for the GPT OSS model.
 
@@ -365,6 +380,9 @@ class GptOssModel(
             state_dict = {
                 key: value.data() for key, value in self.weights.items()
             }
+        has_mxfp4_weights = _should_enable_mxfp4(
+            state_dict, encoding=self.encoding
+        )
         model_config = GptOssConfig.generate(
             pipeline_config=self.pipeline_config,
             huggingface_config=huggingface_config,
@@ -376,10 +394,20 @@ class GptOssModel(
             return_logits=self.return_logits,
         )
         nn_model = GptOss(model_config)
+        # Enable MXFP4 on MoE layers if quantized weights are present/encoded.
+        for block in nn_model.language_model.layers:  # type: ignore[attr-defined]
+            moe_layer = getattr(block, "mlp", None)
+            if not _supports_mxfp4(moe_layer):
+                continue
+            if has_mxfp4_weights:
+                moe_layer.enable_mxfp4()  # type: ignore[union-attr]
+            else:
+                # Keep bf16 path if quantized weights are absent.
+                pass
         nn_model.load_state_dict(
             state_dict,
             weight_alignment=1,
-            strict=self._strict_state_dict_loading,
+            strict=self._strict_state_dict_loading and not has_mxfp4_weights,
         )
         self.state_dict = nn_model.state_dict(auto_initialize=False)
 

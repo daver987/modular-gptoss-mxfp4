@@ -13,6 +13,11 @@
 
 from __future__ import annotations
 
+import os
+from collections import defaultdict
+
+import numpy as np
+from max.dtype import DType as MaxDType
 from max.graph.weights import WeightData, Weights
 
 GPT_OSS_SAFETENSOR_MAP: dict[str, str] = {
@@ -23,6 +28,55 @@ GPT_OSS_SAFETENSOR_MAP: dict[str, str] = {
     # MoE weight mappings
     ".mlp.router": ".mlp.gate.gate_score",
 }
+
+
+def _map_weight_name(name: str) -> str:
+    mapped = name
+    for before, after in GPT_OSS_SAFETENSOR_MAP.items():
+        mapped = mapped.replace(before, after)
+    if mapped.endswith("_blocks"):
+        mapped = f"{mapped[: -len('_blocks')]}.weight.blocks"
+    elif mapped.endswith("_scales"):
+        mapped = f"{mapped[: -len('_scales')]}.weight.scales"
+    return mapped
+
+
+def _as_numpy(value: object) -> np.ndarray:
+    if isinstance(value, np.ndarray):
+        return value
+    if hasattr(value, "to_numpy"):
+        tensor = value
+        orig_dtype = getattr(tensor, "dtype", None)
+        try:
+            return np.asarray(tensor.to_numpy())
+        except RuntimeError:
+            cast = tensor.view(MaxDType.int32)
+            arr = np.asarray(cast.to_numpy())
+            if orig_dtype == MaxDType.uint8:
+                return arr.view(np.uint8)
+            return arr
+    if hasattr(value, "numpy"):
+        return np.asarray(value.numpy())
+    return np.asarray(value)
+
+
+def _convert_blocks_to_qe(
+    blocks: np.ndarray, scales: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert MXFP4 block/scales tensors to packed Q/E layout."""
+    blocks_np = np.asarray(blocks, dtype=np.uint8)
+    scales_np = np.asarray(scales, dtype=np.uint8)
+    if blocks_np.shape[-1] != 16:
+        raise ValueError(
+            "Expected MXFP4 blocks to have trailing dimension 16, got"
+            f" {blocks_np.shape}."
+        )
+    prefix = blocks_np.shape[:-2]
+    group = blocks_np.shape[-2]
+    bytes_per_group = blocks_np.shape[-1]
+    q = blocks_np.reshape(*prefix, group * bytes_per_group)
+    e = scales_np.reshape(*prefix, group)
+    return q, e
 
 
 def convert_safetensor_state_dict(
@@ -37,13 +91,36 @@ def convert_safetensor_state_dict(
         Dictionary of converted weight data
     """
 
-    # Now remap all weight names from HuggingFace to MAX format
-    new_state_dict: dict[str, WeightData] = {}
+    new_state: dict[str, WeightData] = {}
+    pending_mxfp4: dict[str, dict[str, np.ndarray]] = defaultdict(dict)
 
-    for weight_name, value in state_dict.items():
-        max_name: str = weight_name
-        for before, after in GPT_OSS_SAFETENSOR_MAP.items():
-            max_name = max_name.replace(before, after)
-        new_state_dict[max_name] = value.data()
+    for weight_name, accessor in state_dict.items():
+        mapped_name = _map_weight_name(weight_name)
+        weight_data = accessor.data()
+        value_np = _as_numpy(weight_data.data)
 
-    return new_state_dict
+        if mapped_name.endswith(".blocks"):
+            base = mapped_name[: -len(".blocks")]
+            pending_mxfp4[base]["blocks"] = value_np
+            continue
+        if mapped_name.endswith(".scales"):
+            base = mapped_name[: -len(".scales")]
+            pending_mxfp4[base]["scales"] = value_np
+            continue
+
+        new_state[mapped_name] = weight_data
+
+    for base, tensors in pending_mxfp4.items():
+        if "blocks" not in tensors or "scales" not in tensors:
+            raise ValueError(
+                f"Incomplete MXFP4 tensor for '{base}': found {list(tensors.keys())}"
+            )
+        q, e = _convert_blocks_to_qe(tensors["blocks"], tensors["scales"])
+        new_state[f\"{base}.q\"] = WeightData.from_numpy(
+            np.ascontiguousarray(q, dtype=np.uint8), f\"{base}.q\"
+        )
+        new_state[f\"{base}.e\"] = WeightData.from_numpy(
+            np.ascontiguousarray(e, dtype=np.uint8), f\"{base}.e\"
+        )
+
+    return new_state

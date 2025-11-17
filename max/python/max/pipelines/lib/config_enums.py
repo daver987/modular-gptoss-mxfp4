@@ -96,6 +96,7 @@ class SupportedEncoding(str, Enum):
     q6_k = "q6_k"
     float8_e4m3fn = "float8_e4m3fn"
     gptq = "gptq"
+    mxfp4 = "mxfp4"
 
     @classmethod
     def parse_from_file_name(cls, name: str):  # noqa: ANN206
@@ -164,6 +165,7 @@ _SUPPORTED_ENCODING_TO_DTYPE = {
     SupportedEncoding.q4_0: DType.uint8,
     SupportedEncoding.q6_k: DType.uint8,
     SupportedEncoding.gptq: DType.uint8,
+    SupportedEncoding.mxfp4: DType.bfloat16,
 }
 
 
@@ -175,6 +177,7 @@ _SUPPORTED_ENCODING_TO_CACHE_DTYPE = {
     SupportedEncoding.q4_0: DType.float32,
     SupportedEncoding.q6_k: DType.float32,
     SupportedEncoding.gptq: DType.bfloat16,
+    SupportedEncoding.mxfp4: DType.bfloat16,
 }
 
 _SUPPORTED_ENCODING_TO_QUANTIZATION_ENCODING = {
@@ -185,6 +188,7 @@ _SUPPORTED_ENCODING_TO_QUANTIZATION_ENCODING = {
     SupportedEncoding.q4_0: QuantizationEncoding.Q4_0,
     SupportedEncoding.q6_k: QuantizationEncoding.Q6_K,
     SupportedEncoding.gptq: QuantizationEncoding.GPTQ,
+    SupportedEncoding.mxfp4: None,
 }
 
 
@@ -197,4 +201,5 @@ _SUPPORTED_DEVICES: dict[SupportedEncoding, tuple[str, ...]] = {
     SupportedEncoding.q4_0: ("cpu",),
     SupportedEncoding.q6_k: ("cpu",),
     SupportedEncoding.gptq: ("gpu",),
+    SupportedEncoding.mxfp4: ("gpu",),
 }
