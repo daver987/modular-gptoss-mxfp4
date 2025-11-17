@@ -58,6 +58,7 @@ from comm.allreduce import MAX_GPUS, Signal, allreduce
 from compiler_internal import StaticTensorSpec
 from gpu.host import DeviceContext
 from gpu.host.info import is_cpu, is_gpu, is_valid_target
+from quantization.mxfp4_kernels import MXFP4GroupedMatMulRaggedEXQ
 from kv_cache.types import (
     ContinuousBatchingKVCacheCollection,
     KVCacheStaticParams,
@@ -7069,6 +7070,44 @@ struct Struct_grouped_matmul_ragged:
             Int(max_num_tokens_per_expert),
             Int(num_active_experts),
             cuda_ctx,
+        )
+
+
+@compiler.register("modular_ops::mxfp4_grouped_matmul_exq")
+struct Struct_mxfp4_grouped_matmul_exq:
+    @always_inline
+    @staticmethod
+    fn execute[
+        out_dtype: DType,
+        in_dtype: DType,
+        target: StaticString,
+    ](
+        out_y: OutputTensor[dtype=out_dtype, rank=2],
+        hidden: InputTensor[dtype=in_dtype, rank=2],
+        q: InputTensor[dtype = DType.uint8, rank=3],
+        e: InputTensor[dtype = DType.uint8, rank=3],
+        expert_start_indices: InputTensor[dtype = DType.uint32, rank=1],
+        expert_ids: InputTensor[dtype = DType.int32, rank=1],
+        max_tokens_per_expert: UInt32,
+        num_active_experts: UInt32,
+        context: DeviceContextPtr,
+    ) raises:
+        constrained[
+            is_gpu[target](),
+            "mxfp4 grouped matmul only supports GPUs",
+        ]()
+        MXFP4GroupedMatMulRaggedEXQ.execute[
+            out_dtype=out_dtype, in_dtype=in_dtype, target=target
+        ](
+            out_y,
+            hidden,
+            q,
+            e,
+            expert_start_indices,
+            expert_ids,
+            max_tokens_per_expert,
+            num_active_experts,
+            context,
         )
 
 
