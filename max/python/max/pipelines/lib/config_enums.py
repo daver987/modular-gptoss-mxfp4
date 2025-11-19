@@ -96,6 +96,7 @@ class SupportedEncoding(str, Enum):
     q6_k = "q6_k"
     float8_e4m3fn = "float8_e4m3fn"
     gptq = "gptq"
+    mxfp4 = "mxfp4"
 
     @classmethod
     def parse_from_file_name(cls, name: str):  # noqa: ANN206
@@ -113,6 +114,8 @@ class SupportedEncoding(str, Enum):
             return SupportedEncoding.q6_k
         elif "gptq" in name:
             return SupportedEncoding.gptq
+        elif "mxfp4" in name or "mx4" in name:
+            return SupportedEncoding.mxfp4
         elif "f8" in name or "fp8" in name or "float8" in name:
             # For now, default float8 to e4m3. It is the dtype is used for inference.
             return SupportedEncoding.float8_e4m3fn
@@ -164,6 +167,7 @@ _SUPPORTED_ENCODING_TO_DTYPE = {
     SupportedEncoding.q4_0: DType.uint8,
     SupportedEncoding.q6_k: DType.uint8,
     SupportedEncoding.gptq: DType.uint8,
+    SupportedEncoding.mxfp4: DType.bfloat16,
 }
 
 
@@ -175,6 +179,7 @@ _SUPPORTED_ENCODING_TO_CACHE_DTYPE = {
     SupportedEncoding.q4_0: DType.float32,
     SupportedEncoding.q6_k: DType.float32,
     SupportedEncoding.gptq: DType.bfloat16,
+    SupportedEncoding.mxfp4: DType.bfloat16,
 }
 
 _SUPPORTED_ENCODING_TO_QUANTIZATION_ENCODING = {
@@ -185,6 +190,7 @@ _SUPPORTED_ENCODING_TO_QUANTIZATION_ENCODING = {
     SupportedEncoding.q4_0: QuantizationEncoding.Q4_0,
     SupportedEncoding.q6_k: QuantizationEncoding.Q6_K,
     SupportedEncoding.gptq: QuantizationEncoding.GPTQ,
+    SupportedEncoding.mxfp4: QuantizationEncoding.MXFP4,
 }
 
 
@@ -197,4 +203,5 @@ _SUPPORTED_DEVICES: dict[SupportedEncoding, tuple[str, ...]] = {
     SupportedEncoding.q4_0: ("cpu",),
     SupportedEncoding.q6_k: ("cpu",),
     SupportedEncoding.gptq: ("gpu",),
+    SupportedEncoding.mxfp4: ("gpu",),
 }

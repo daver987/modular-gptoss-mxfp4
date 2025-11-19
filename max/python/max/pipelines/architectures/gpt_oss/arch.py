@@ -35,6 +35,7 @@ gpt_oss_arch = SupportedArchitecture(
     default_encoding=SupportedEncoding.bfloat16,
     supported_encodings={
         SupportedEncoding.bfloat16: [KVCacheStrategy.PAGED],
+        SupportedEncoding.mxfp4: [KVCacheStrategy.PAGED],
     },
     pipeline_model=GptOssModel,
     task=PipelineTask.TEXT_GENERATION,

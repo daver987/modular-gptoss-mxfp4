@@ -85,6 +85,8 @@ class QuantizationEncoding(enum.Enum):
             6-bit K-quantization with 256 elements per block.
         GPTQ
             Group-wise Post-Training Quantization for large language models.
+        MXFP4
+            Microscaling FP4 with 32 elements per block and 1-byte power-of-two scale.
     """
 
     Q4_0 = "Q4_0"
@@ -92,6 +94,7 @@ class QuantizationEncoding(enum.Enum):
     Q5_K = "Q5_K"
     Q6_K = "Q6_K"
     GPTQ = "GPTQ"
+    MXFP4 = "MXFP4"
 
     @property
     def block_parameters(self) -> BlockParameters:
@@ -171,4 +174,5 @@ _BLOCK_PARAMETERS: dict[QuantizationEncoding, BlockParameters] = {
     QuantizationEncoding.Q6_K: BlockParameters(
         256, 256 // 2 + 256 // 4 + 256 // 16 + 2
     ),
+    QuantizationEncoding.MXFP4: BlockParameters(32, 17),
 }

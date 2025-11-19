@@ -17,16 +17,28 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from copy import copy
+from dataclasses import dataclass
 
 from max.dtype import DType
 from max.graph import DeviceRef, ShardingStrategy, TensorValue, Weight, ops
+from max.graph.quantization import QuantizationEncoding
 from max.nn.clamp import clamp
-from max.nn.kernels import grouped_matmul_ragged, moe_create_indices
+from max.nn.kernels import (
+    grouped_matmul_ragged,
+    grouped_mxfp4_matmul,
+    moe_create_indices,
+)
 from max.nn.layer import LayerList, Shardable
 from max.nn.linear import Linear
 from max.nn.moe import MoE, MoEGate
 
 from ..model_config import GptOssConfig
+
+
+@dataclass
+class Mxfp4ExpertWeights:
+    blocks: Weight
+    scales: Weight
 
 
 class GptOssMoEGate(MoEGate):
@@ -104,6 +116,9 @@ class GptOssMoE(MoE, Shardable):
 
         self.config = config
         self._sharding_strategy = None
+        self._use_mxfp4 = config.is_mxfp4()
+        self._mxfp4_gate_up_proj: Mxfp4ExpertWeights | None = None
+        self._mxfp4_down_proj: Mxfp4ExpertWeights | None = None
 
         # Initialize parent class
         super().__init__(
@@ -124,22 +139,35 @@ class GptOssMoE(MoE, Shardable):
         # This matches how the weights are stored in the checkpoint
         self.experts = LayerList([])  # Empty list to maintain compatibility
 
-        # Create combined weight tensors for all experts
-        # Gate and up projections are combined into one tensor
-        self._experts_gate_up_proj_weight = Weight(
-            "experts.gate_up_proj",
-            shape=[self.num_experts, self.hidden_dim, 2 * self.moe_dim],
-            dtype=self.dtype,
-            device=self.devices[0],
-        )
+        self._experts_gate_up_proj_weight: Weight | None = None
+        self._experts_down_proj_weight: Weight | None = None
 
-        # Down projection weights
-        self._experts_down_proj_weight = Weight(
-            "experts.down_proj",
-            shape=[self.num_experts, self.moe_dim, self.hidden_dim],
-            dtype=self.dtype,
-            device=self.devices[0],
-        )
+        if self._use_mxfp4:
+            self._mxfp4_gate_up_proj = self._allocate_mxfp4_weights(
+                "experts.gate_up_proj",
+                out_features=2 * self.moe_dim,
+                in_features=self.hidden_dim,
+            )
+            self._mxfp4_down_proj = self._allocate_mxfp4_weights(
+                "experts.down_proj",
+                out_features=self.hidden_dim,
+                in_features=self.moe_dim,
+            )
+        else:
+            self._experts_gate_up_proj_weight = Weight(
+                "experts.gate_up_proj",
+                shape=[self.num_experts, self.hidden_dim, 2 * self.moe_dim],
+                dtype=self.dtype,
+                device=self.devices[0],
+            )
+            self._experts_down_proj_weight = Weight(
+                "experts.down_proj",
+                shape=[self.num_experts, self.moe_dim, self.hidden_dim],
+                dtype=self.dtype,
+                device=self.devices[0],
+            )
+            self._mxfp4_gate_up_proj = None
+            self._mxfp4_down_proj = None
 
         # Bias terms for gate_up projection (combined)
         self._experts_gate_up_proj_bias = Weight(
@@ -157,16 +185,51 @@ class GptOssMoE(MoE, Shardable):
             device=self.devices[0],
         )
 
+    def _allocate_mxfp4_weights(
+        self, base_name: str, *, out_features: int, in_features: int
+    ) -> Mxfp4ExpertWeights:
+        if in_features % 32 != 0:
+            raise ValueError(
+                f"MXFP4 tensors require input dims divisible by 32, got {in_features} for {base_name}"
+            )
+        blocks = Weight(
+            f"{base_name}.blocks",
+            shape=[
+                self.num_experts,
+                out_features,
+                in_features // 2,
+            ],
+            dtype=DType.uint8,
+            device=self.devices[0],
+            quantization_encoding=QuantizationEncoding.MXFP4,
+        )
+        scales = Weight(
+            f"{base_name}.scales",
+            shape=[
+                self.num_experts,
+                out_features,
+                in_features // 32,
+            ],
+            dtype=DType.uint8,
+            device=self.devices[0],
+            quantization_encoding=QuantizationEncoding.MXFP4,
+        )
+        return Mxfp4ExpertWeights(blocks=blocks, scales=scales)
+
     @property
     def gate_up_proj(self) -> TensorValue:
         # Return the combined gate_up projection weights, transposed for grouped_matmul_ragged
         # grouped_matmul_ragged expects shape [num_experts, out_features, in_features]
+        if self._experts_gate_up_proj_weight is None:
+            raise RuntimeError("Gate/up projection unavailable in MXFP4 mode.")
         return self._experts_gate_up_proj_weight.transpose(1, 2)
 
     @property
     def down_proj(self) -> TensorValue:
         # Return the combined down projection weights, transposed for grouped_matmul_ragged
         # grouped_matmul_ragged expects shape [num_experts, out_features, in_features]
+        if self._experts_down_proj_weight is None:
+            raise RuntimeError("Down projection unavailable in MXFP4 mode.")
         return self._experts_down_proj_weight.transpose(1, 2)
 
     @property
@@ -218,14 +281,27 @@ class GptOssMoE(MoE, Shardable):
                 router_weight.reshape([-1, 1]), token_expert_order, axis=0
             ).cast(x.dtype)
 
+        expert_usage_stats_host = expert_usage_stats.to(DeviceRef.CPU())
+
         # Apply gate_up projection with bias
-        gate_up_output = grouped_matmul_ragged(
-            permutated_states,
-            self.gate_up_proj,
-            expert_start_indices,
-            expert_ids,
-            expert_usage_stats.to(DeviceRef.CPU()),
-        )
+        if self._use_mxfp4:
+            assert self._mxfp4_gate_up_proj is not None
+            gate_up_output = grouped_mxfp4_matmul(
+                permutated_states,
+                self._mxfp4_gate_up_proj.blocks,
+                self._mxfp4_gate_up_proj.scales,
+                expert_start_indices,
+                expert_ids,
+                expert_usage_stats_host,
+            )
+        else:
+            gate_up_output = grouped_matmul_ragged(
+                permutated_states,
+                self.gate_up_proj,
+                expert_start_indices,
+                expert_ids,
+                expert_usage_stats_host,
+            )
 
         # Apply bias based on expert assignment
         # We need to gather the bias for each token based on which expert it was routed to
@@ -249,13 +325,24 @@ class GptOssMoE(MoE, Shardable):
         gated_output = (up + 1.0) * glu
 
         # Apply down projection
-        down_output = grouped_matmul_ragged(
-            gated_output,
-            self.down_proj,
-            expert_start_indices,
-            expert_ids,
-            expert_usage_stats.to(DeviceRef.CPU()),
-        )
+        if self._use_mxfp4:
+            assert self._mxfp4_down_proj is not None
+            down_output = grouped_mxfp4_matmul(
+                gated_output,
+                self._mxfp4_down_proj.blocks,
+                self._mxfp4_down_proj.scales,
+                expert_start_indices,
+                expert_ids,
+                expert_usage_stats_host,
+            )
+        else:
+            down_output = grouped_matmul_ragged(
+                gated_output,
+                self.down_proj,
+                expert_start_indices,
+                expert_ids,
+                expert_usage_stats_host,
+            )
 
         # Apply bias based on expert assignment
         # Use the same expert assignments we calculated earlier
@@ -304,13 +391,29 @@ class GptOssMoE(MoE, Shardable):
             if self.has_shared_experts:
                 self.shared_experts.sharding_strategy = strategy
 
-            # Set sharding strategy for the combined expert weights
-            self._experts_gate_up_proj_weight.sharding_strategy = (
-                ShardingStrategy.rowwise(strategy.num_devices)
-            )
-            self._experts_down_proj_weight.sharding_strategy = (
-                ShardingStrategy.columnwise(strategy.num_devices)
-            )
+            if self._use_mxfp4:
+                assert (
+                    self._mxfp4_gate_up_proj is not None
+                    and self._mxfp4_down_proj is not None
+                )
+                rowwise = ShardingStrategy.rowwise(strategy.num_devices)
+                colwise = ShardingStrategy.columnwise(strategy.num_devices)
+                self._mxfp4_gate_up_proj.blocks.sharding_strategy = rowwise
+                self._mxfp4_gate_up_proj.scales.sharding_strategy = rowwise
+                self._mxfp4_down_proj.blocks.sharding_strategy = colwise
+                self._mxfp4_down_proj.scales.sharding_strategy = colwise
+            else:
+                # Set sharding strategy for the combined expert weights
+                assert (
+                    self._experts_gate_up_proj_weight is not None
+                    and self._experts_down_proj_weight is not None
+                )
+                self._experts_gate_up_proj_weight.sharding_strategy = (
+                    ShardingStrategy.rowwise(strategy.num_devices)
+                )
+                self._experts_down_proj_weight.sharding_strategy = (
+                    ShardingStrategy.columnwise(strategy.num_devices)
+                )
             self._experts_gate_up_proj_bias.sharding_strategy = (
                 ShardingStrategy.rowwise(strategy.num_devices)
             )
@@ -341,16 +444,31 @@ class GptOssMoE(MoE, Shardable):
         if self.has_shared_experts:
             shared_experts_shards = self.shared_experts.shard(devices)
 
-        # Shard the combined expert weight tensors
-        experts_gate_up_proj_shards = self._experts_gate_up_proj_weight.shard(
-            devices
-        )
-        experts_down_proj_shards = self._experts_down_proj_weight.shard(devices)
+        if self._use_mxfp4:
+            assert (
+                self._mxfp4_gate_up_proj is not None
+                and self._mxfp4_down_proj is not None
+            )
+            gate_up_block_shards = self._mxfp4_gate_up_proj.blocks.shard(
+                devices
+            )
+            gate_up_scale_shards = self._mxfp4_gate_up_proj.scales.shard(
+                devices
+            )
+            down_block_shards = self._mxfp4_down_proj.blocks.shard(devices)
+            down_scale_shards = self._mxfp4_down_proj.scales.shard(devices)
+        else:
+            experts_gate_up_proj_shards = (
+                self._experts_gate_up_proj_weight.shard(devices)
+            )
+            experts_down_proj_shards = (
+                self._experts_down_proj_weight.shard(devices)
+            )
         experts_gate_up_proj_bias_shards = (
             self._experts_gate_up_proj_bias.shard(devices)
         )
-        experts_down_proj_bias_shards = self._experts_down_proj_bias.shard(
-            devices
+        experts_down_proj_bias_shards = (
+            self._experts_down_proj_bias.shard(devices)
         )
 
         shards = []
@@ -381,13 +499,25 @@ class GptOssMoE(MoE, Shardable):
             if self.has_shared_experts:
                 sharded.shared_experts = shared_experts_shards[shard_idx]
 
-            # Replace the combined expert weights with sharded versions
-            sharded._experts_gate_up_proj_weight = experts_gate_up_proj_shards[
-                shard_idx
-            ]
-            sharded._experts_down_proj_weight = experts_down_proj_shards[
-                shard_idx
-            ]
+            if self._use_mxfp4:
+                sharded._mxfp4_gate_up_proj = Mxfp4ExpertWeights(
+                    blocks=gate_up_block_shards[shard_idx],
+                    scales=gate_up_scale_shards[shard_idx],
+                )
+                sharded._mxfp4_down_proj = Mxfp4ExpertWeights(
+                    blocks=down_block_shards[shard_idx],
+                    scales=down_scale_shards[shard_idx],
+                )
+                sharded._experts_gate_up_proj_weight = None
+                sharded._experts_down_proj_weight = None
+            else:
+                # Replace the combined expert weights with sharded versions
+                sharded._experts_gate_up_proj_weight = (
+                    experts_gate_up_proj_shards[shard_idx]
+                )
+                sharded._experts_down_proj_weight = (
+                    experts_down_proj_shards[shard_idx]
+                )
             sharded._experts_gate_up_proj_bias = (
                 experts_gate_up_proj_bias_shards[shard_idx]
             )

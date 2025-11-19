@@ -370,6 +370,7 @@ class GptOssModel(
             cache_dtype=self.encoding.cache_dtype,
             kv_cache_config=self.kv_cache_config,
             return_logits=self.return_logits,
+            encoding=self.encoding,
         )
         nn_model = GptOss(model_config)
         nn_model.load_state_dict(
