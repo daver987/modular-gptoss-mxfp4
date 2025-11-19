@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from max.dtype import DType
 from max.graph import DeviceRef
@@ -26,6 +27,7 @@ from max.pipelines.lib import (
     MAXModelConfigBase,
     PipelineConfig,
     RopeType,
+    SupportedEncoding,
 )
 from transformers import AutoConfig
 
@@ -144,6 +146,11 @@ class GptOssConfig(MAXModelConfig, GptOssConfigBase):
     provides methods to derive necessary pipeline components like KV cache parameters.
     """
 
+    quantization: Literal["bf16", "mxfp4"] = "bf16"
+
+    def is_mxfp4(self) -> bool:
+        return self.quantization == "mxfp4"
+
     @staticmethod
     def get_kv_params(
         huggingface_config: AutoConfig,
@@ -219,6 +226,7 @@ class GptOssConfig(MAXModelConfig, GptOssConfigBase):
         cache_dtype: DType,
         kv_cache_config: KVCacheConfig,
         return_logits: ReturnLogits,
+        encoding: SupportedEncoding,
     ) -> GptOssConfig:
         """Generates a GptOssConfig instance from various configuration sources.
 
@@ -321,6 +329,10 @@ class GptOssConfig(MAXModelConfig, GptOssConfigBase):
         )
         swiglu_limit = getattr(huggingface_config, "swiglu_limit", 7.0)
 
+        quantization_mode: Literal["bf16", "mxfp4"] = (
+            "mxfp4" if encoding == SupportedEncoding.mxfp4 else "bf16"
+        )
+
         return GptOssConfig(
             vocab_size=huggingface_config.vocab_size,
             hidden_size=huggingface_config.hidden_size,
@@ -364,6 +376,7 @@ class GptOssConfig(MAXModelConfig, GptOssConfigBase):
                 kv_cache_config=kv_cache_config,
                 cache_dtype=cache_dtype,
             ),
+            quantization=quantization_mode,
         )
 
 

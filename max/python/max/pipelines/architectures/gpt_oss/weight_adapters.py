@@ -13,6 +13,10 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+
+from max.dtype import DType
+from max.graph.quantization import QuantizationEncoding
 from max.graph.weights import WeightData, Weights
 
 GPT_OSS_SAFETENSOR_MAP: dict[str, str] = {
@@ -24,6 +28,31 @@ GPT_OSS_SAFETENSOR_MAP: dict[str, str] = {
     ".mlp.router": ".mlp.gate.gate_score",
 }
 
+_MXFP4_REQUIRED_SUFFIXES = {"blocks", "scales"}
+
+
+def _maybe_mark_mxfp4_weight(
+    name: str, weight_data: WeightData, tracking: dict[str, set[str]]
+) -> WeightData:
+    if ".mlp.experts." not in name:
+        return weight_data
+
+    if name.endswith(".blocks"):
+        suffix = "blocks"
+    elif name.endswith(".scales"):
+        suffix = "scales"
+    else:
+        return weight_data
+
+    base_name = name[: -(len(suffix) + 1)]
+    tracking[base_name].add(suffix)
+
+    if weight_data.dtype != DType.uint8:
+        weight_data = weight_data.astype(DType.uint8)
+        weight_data.name = name
+
+    weight_data.quantization_encoding = QuantizationEncoding.MXFP4
+    return weight_data
 
 def convert_safetensor_state_dict(
     state_dict: dict[str, Weights], **kwargs
@@ -39,11 +68,29 @@ def convert_safetensor_state_dict(
 
     # Now remap all weight names from HuggingFace to MAX format
     new_state_dict: dict[str, WeightData] = {}
+    mxfp4_pairs: dict[str, set[str]] = defaultdict(set)
 
     for weight_name, value in state_dict.items():
         max_name: str = weight_name
         for before, after in GPT_OSS_SAFETENSOR_MAP.items():
             max_name = max_name.replace(before, after)
-        new_state_dict[max_name] = value.data()
+        weight_data = value.data()
+        weight_data.name = max_name
+        weight_data = _maybe_mark_mxfp4_weight(
+            max_name, weight_data, mxfp4_pairs
+        )
+        new_state_dict[max_name] = weight_data
+
+    missing_pairs = [
+        base_name
+        for base_name, suffixes in mxfp4_pairs.items()
+        if suffixes != _MXFP4_REQUIRED_SUFFIXES
+    ]
+    if missing_pairs:
+        formatted = ", ".join(sorted(missing_pairs))
+        raise ValueError(
+            "Incomplete MXFP4 tensors detected; found only one of blocks/scales for "
+            f"{formatted}. Please ensure the checkpoint includes both tensors."
+        )
 
     return new_state_dict
