@@ -75,12 +75,12 @@ fn mxfp4_grouped_matmul_kernel[
     scales: LayoutTensor[DType.uint8, scale_layout, MutAnyOrigin],
     expert_offsets: LayoutTensor[DType.uint32, offsets_layout, MutAnyOrigin],
     expert_ids: LayoutTensor[DType.int32, ids_layout, MutAnyOrigin],
-) raises:
+):
     var expert_block = Int(block_idx.z)
-    var offsets_ptr = expert_offsets.data
-    var ids_ptr = expert_ids.data
-    var start_offset = Int(offsets_ptr[expert_block].value)
-    var end_offset = Int(offsets_ptr[expert_block + 1].value)
+    var offsets_ptr = expert_offsets.ptr
+    var ids_ptr = expert_ids.ptr
+    var start_offset = Int(offsets_ptr[expert_block])
+    var end_offset = Int(offsets_ptr[expert_block + 1])
     var tokens_for_expert = end_offset - start_offset
     if tokens_for_expert <= 0:
         return
@@ -90,17 +90,17 @@ fn mxfp4_grouped_matmul_kernel[
     var in_features = packed_stride * 2
     var scale_stride = scales.dim(2)
 
-    var a_data = a.data + UInt(start_offset * in_features)
-    var expert = Int(ids_ptr[expert_block].value)
+    var a_data = a.ptr + UInt(start_offset * in_features)
+    var expert = Int(ids_ptr[expert_block])
 
     if expert == -1:
         return
 
     var packed_by_expert = (
-        packed_b.data + UInt(expert * num_outputs * packed_stride)
+        packed_b.ptr + UInt(expert * num_outputs * packed_stride)
     )
     var scales_by_expert = (
-        scales.data + UInt(expert * num_outputs * scale_stride)
+        scales.ptr + UInt(expert * num_outputs * scale_stride)
     )
 
     var n = Int(global_idx.x)
@@ -133,7 +133,7 @@ fn mxfp4_grouped_matmul_kernel[
         ].cast[DType.float32]()
         accum += a_val * scaled_weight
 
-    var c_data = c.data + UInt(start_offset * num_outputs)
+    var c_data = c.ptr + UInt(start_offset * num_outputs)
     c_data[UInt(m * num_outputs + n)] = Scalar[c_type](accum)
 
 

@@ -7088,7 +7088,7 @@ struct Struct_moe_mx4_matmul:
         num_active_experts: UInt32,
         context: DeviceContextPtr,
     ) raises:
-        ctx = context.get_device_context()
+        var ctx = context.get_device_context()
         mxfp4_grouped_matmul[c_type, a_type, target](
             managed_tensor_slice_to_ndbuffer(c),
             managed_tensor_slice_to_ndbuffer(a),
