@@ -511,19 +511,14 @@ class GptOssMoE(MoE, Shardable):
         for shard_idx, device in enumerate(devices):
             new_config = copy(self.config)
             new_config.devices = [device]
-            new_config.hidden_size = (
-                self.hidden_dim // self._sharding_strategy.num_devices
-            )
+            new_config.hidden_size = self.hidden_dim
             new_config.intermediate_size = (
                 self.moe_dim // self._sharding_strategy.num_devices
             )
             new_config.num_local_experts = (
                 self.num_experts // self._sharding_strategy.num_devices
             )
-            new_config.num_experts_per_tok = (
-                self.num_experts_per_token
-                // self._sharding_strategy.num_devices
-            )
+            new_config.num_experts_per_tok = self.num_experts_per_token
             new_config.dtype = self.dtype
 
             sharded = GptOssMoE(
