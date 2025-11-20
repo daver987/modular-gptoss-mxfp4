@@ -14,5 +14,3 @@
 # Reuse the core MXFP4 implementation to avoid diverging copies between the
 # built-in kernel and the custom packaged op.
 from nn.moe_mxfp4 import mxfp4_grouped_matmul
-
-__all__ = ["mxfp4_grouped_matmul"]

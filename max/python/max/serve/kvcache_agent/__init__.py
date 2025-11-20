@@ -11,6 +11,17 @@
 # limitations under the License.
 # ===----------------------------------------------------------------------=== #
 
+# Ensure generated proto stubs are importable when running from a source checkout.
+# Bazel writes kvcache_agent_service_v1_pb2*.py to bazel-bin/max/python/max/serve/kvcache_agent.
+# When this package is imported directly from the repo, add that directory to __path__ if present.
+from pathlib import Path
+
+for parent in Path(__file__).resolve().parents:
+    candidate = parent / "bazel-bin" / "max" / "python" / "max" / "serve" / "kvcache_agent"
+    if candidate.exists():
+        __path__.append(str(candidate))
+        break
+
 from .dispatcher_v2 import DispatcherClientV2, DispatcherServerV2
 from .kvcache_agent import start_kvcache_agent_service
 

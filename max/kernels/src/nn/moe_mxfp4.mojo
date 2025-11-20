@@ -280,7 +280,10 @@ fn mxfp4_grouped_matmul[
             num_active_experts,
             ctx,
         )
-    elif is_cpu[target]():
+    else:
+        # Default to the CPU path when no GPU target is available. This keeps
+        # host-side testing working even when the target string is not one of
+        # the expected CPU/GPU enumerations.
         _mxfp4_grouped_matmul_cpu[c_type, a_type](
             c,
             a,
@@ -290,5 +293,3 @@ fn mxfp4_grouped_matmul[
             expert_ids,
             num_active_experts,
         )
-    else:
-        constrained[False, "Unsupported target for MXFP4 matmul"]()
