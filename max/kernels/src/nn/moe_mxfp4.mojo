@@ -111,27 +111,25 @@ fn mxfp4_grouped_matmul_kernel[
 
     var accum = Float32(0.0)
 
-    for k in range(in_features):
-        var packed_index = k >> 1
-        var packed_byte = packed_by_expert[
-            n * packed_stride + packed_index
-        ]
-        var nibble: UInt8
-        if (k & 1) == 0:
-            nibble = packed_byte & UInt8(0x0F)
-        else:
-            nibble = packed_byte >> 4
+    var packed_row = packed_by_expert + UInt(n * packed_stride)
+    var scale_row = scales_by_expert + UInt(n * scale_stride)
+    var a_row = a_data + UInt(m * in_features)
 
-        var weight = _FP4_VALUES[Int(nibble)]
-        var scale_block = k // 32
-        var scale_byte = scales_by_expert[
-            n * scale_stride + scale_block
-        ]
-        var scaled_weight = weight * _scale_multiplier(scale_byte)
-        var a_val = a_data[
-            UInt(m * in_features + k)
-        ].cast[DType.float32]()
-        accum += a_val * scaled_weight
+    var num_blocks = in_features // 32
+    for scale_block in range(num_blocks):
+        var scale_mul = _scale_multiplier(scale_row[scale_block])
+        var packed_block = packed_row + UInt(scale_block * 16)
+        var k_base = scale_block * 32
+
+        for byte_idx in range(16):
+            var packed_byte = packed_block[byte_idx]
+            var w0 = _FP4_VALUES[Int(packed_byte & UInt8(0x0F))] * scale_mul
+            var w1 = _FP4_VALUES[Int(packed_byte >> 4)] * scale_mul
+
+            var k0 = k_base + byte_idx * 2
+            var a0 = a_row[UInt(k0)].cast[DType.float32]()
+            var a1 = a_row[UInt(k0 + 1)].cast[DType.float32]()
+            accum += a0 * w0 + a1 * w1
 
     var c_data = c.ptr + UInt(start_offset * num_outputs)
     c_data[UInt(m * num_outputs + n)] = Scalar[c_type](accum)
@@ -235,21 +233,27 @@ fn _mxfp4_grouped_matmul_cpu[
         var scale_row = scales.data + expert * num_outputs * scale_stride
 
         for m in range(tokens):
+            var a_row = a_slice + UInt(m * in_features)
             for n in range(num_outputs):
                 var accum = Float32(0.0)
-                for k in range(in_features):
-                    var weight = _decode_weight(
-                        packed_row,
-                        scale_row,
-                        packed_stride,
-                        scale_stride,
-                        n,
-                        k,
-                    )
-                    var a_val = a_slice[
-                        UInt(m * in_features + k)
-                    ].cast[DType.float32]()
-                    accum += a_val * weight
+                var packed_row_n = packed_row + n * packed_stride
+                var scale_row_n = scale_row + n * scale_stride
+                var num_blocks = in_features // 32
+                for scale_block in range(num_blocks):
+                    var scale_mul = _scale_multiplier(scale_row_n[scale_block])
+                    var k_base = scale_block * 32
+                    var packed_block = packed_row_n + scale_block * 16
+                    for byte_idx in range(16):
+                        var packed_byte = packed_block[byte_idx]
+                        var w0 = _FP4_VALUES[
+                            Int(packed_byte & UInt8(0x0F))
+                        ] * scale_mul
+                        var w1 = _FP4_VALUES[Int(packed_byte >> 4)] * scale_mul
+
+                        var k0 = k_base + byte_idx * 2
+                        var a0 = a_row[UInt(k0)].cast[DType.float32]()
+                        var a1 = a_row[UInt(k0 + 1)].cast[DType.float32]()
+                        accum += a0 * w0 + a1 * w1
                 out_slice[UInt(m * num_outputs + n)] = Scalar[c_type](accum)
 
 
