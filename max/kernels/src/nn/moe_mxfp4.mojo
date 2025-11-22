@@ -31,6 +31,7 @@ from gpu.host.nvidia.tma import TensorMapSwizzle
 from gpu.mma import st_matrix
 from gpu.memory import AddressSpace
 from layout import Layout, LayoutTensor
+from layout.int_tuple import IntTuple
 from layout._ndbuffer_stub import from_ndbuffer_row_major
 from layout.runtime_layout import RuntimeLayout, RuntimeTuple, UNKNOWN_VALUE
 from layout.tensor_core_async import (
