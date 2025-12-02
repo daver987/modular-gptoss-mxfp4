@@ -8,11 +8,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 CUSTOM_EXT="${MAX_CUSTOM_EXTENSIONS:-${MXFP4_KERNEL_PACKAGE:-}}"
 if [[ -z "${CUSTOM_EXT}" ]]; then
-  DEFAULT_EXT="${REPO_ROOT}/bazel-bin/max/kernels/src/custom_ops/mogg_mxfp4/mogg_mxfp4.mojopkg"
+  # Try MOGGKernelAPI first (built-in MXFP4 kernels)
+  DEFAULT_EXT="${REPO_ROOT}/bazel-bin/max/kernels/src/Mogg/MOGGKernelAPI/MOGGKernelAPI.mojopkg"
   if [[ -f "${DEFAULT_EXT}" ]]; then
     CUSTOM_EXT="${DEFAULT_EXT}"
   else
     echo "No custom extension provided. Set MAX_CUSTOM_EXTENSIONS or MXFP4_KERNEL_PACKAGE." >&2
+    echo "Build the kernels first with: ./bazelw build //max/kernels/src/Mogg/MOGGKernelAPI:MOGGKernelAPI" >&2
     exit 1
   fi
 fi

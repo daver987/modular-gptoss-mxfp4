@@ -29,11 +29,16 @@ PY
 )"
 
 local_kernel_path="$repo_root/max/kernels/src"
+bazel_bin_path="$repo_root/bazel-bin/max/kernels/src"
 extra_paths=()
+# Put local bazel-built packages first so they override SDK packages
+if [[ -d "$bazel_bin_path" ]]; then
+  extra_paths+=("$bazel_bin_path")
+fi
+extra_paths+=("$local_kernel_path")
 if [[ -n "$mojo_lib_dir" ]]; then
   extra_paths+=("$mojo_lib_dir")
 fi
-extra_paths+=("$local_kernel_path")
 
 combine_paths() {
   local joined=()
@@ -56,7 +61,8 @@ combine_colon_paths() {
 MODULAR_MOJO_MAX_IMPORT_PATH="$(combine_paths "${extra_paths[@]}" "$default_import_path" "$existing_import_path")"
 
 export MODULAR_MOJO_MAX_IMPORT_PATH
-export MOJO_PACKAGE_PATH="$(combine_colon_paths "$mojo_lib_dir" "${MOJO_PACKAGE_PATH:-}")"
+# Put bazel-bin first in MOJO_PACKAGE_PATH so locally built packages override SDK
+export MOJO_PACKAGE_PATH="$(combine_colon_paths "$bazel_bin_path" "$mojo_lib_dir" "${MOJO_PACKAGE_PATH:-}")"
 
 py_paths=("$repo_root/max/python" "$repo_root/mojo/python")
 if [[ -n "${PYTHONPATH:-}" ]]; then

@@ -146,7 +146,7 @@ class GptOssConfig(MAXModelConfig, GptOssConfigBase):
     provides methods to derive necessary pipeline components like KV cache parameters.
     """
 
-    quantization: Literal["mxfp4"]
+    quantization: Literal["mxfp4"] = "mxfp4"
 
     def is_mxfp4(self) -> bool:
         return self.quantization == "mxfp4"

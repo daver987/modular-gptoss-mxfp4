@@ -89,4 +89,5 @@ be layered on by editing `.vscode/launch.json` or exporting variables in the ter
 ## Clean-up performed
 
 - Removed `serve.log` and generated `kvcache_agent_service_v1_pb2*.py` files.
-- All MXFP4-related changes live under `max/kernels/src/custom_ops/mogg_mxfp4` and the new helper `max/python/max/pipelines/lib/custom_extensions.py`.
+- MXFP4 kernels are now registered directly in MOGGKernelAPI.mojo (built-in path).
+- The `custom_ops/mogg_mxfp4` package is no longer needed; use MOGGKernelAPI instead.
