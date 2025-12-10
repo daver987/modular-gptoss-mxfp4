@@ -12,4 +12,4 @@ serve = "python -m max.entrypoints.pipelines serve --custom-architectures qwen2 
 
 [dependencies]
 python = ">=3.9,<3.14"
-modular = "*"
+modular = ">=26.1.0.dev2025120907,<27"
