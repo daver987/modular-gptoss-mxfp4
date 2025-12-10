@@ -3,6 +3,8 @@ description: This rule outlines best practices for effective use of Git, includi
 globs:
 alwaysApply: false
 ---
+# Git best practices
+
 - **Commit Strategies:**
   - **Atomic Commits:** Keep commits small and focused. Each commit should address a single, logical change. This makes it easier to understand the history and revert changes if needed.
   - **Descriptive Commit Messages:** Write clear, concise, and informative commit messages. Explain the *why* behind the change, not just *what* was changed. Use a consistent format (e.g., imperative mood: "Fix bug", "Add feature").
