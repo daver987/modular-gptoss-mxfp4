@@ -84,27 +84,29 @@ fn moe_w1_mxfp4_swiglu_tc[
     var row0 = seg_start + Int(block_idx.y) * BM
 
     # Shared staging.
-    var token_ids_s = stack_allocation[BM, Scalar[U32], address_space=AddressSpace.SHARED]()
+    var token_ids_s = stack_allocation[
+        BM, Scalar[U32], address_space = AddressSpace.SHARED
+    ]()
 
     var A_s = LayoutTensor[
         BF16,
         Layout.row_major(BM, BK),
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space = AddressSpace.SHARED,
     ].stack_allocation()
 
     var B_s = LayoutTensor[
         BF16,
         Layout.row_major(BK, BN_RAW),
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space = AddressSpace.SHARED,
     ].stack_allocation()
 
     var C_s = LayoutTensor[
         F32,
         Layout.row_major(BM, BN_RAW),
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space = AddressSpace.SHARED,
     ].stack_allocation()
 
     # Precompute token ids for the BM rows.
@@ -133,7 +135,7 @@ fn moe_w1_mxfp4_swiglu_tc[
             F32,
             Layout.row_major(WM // MMA_M, (WN * 4) // MMA_N),
             MutAnyOrigin,
-            address_space=AddressSpace.LOCAL,
+            address_space = AddressSpace.LOCAL,
         ]
         .stack_allocation()
         .fill(0)
@@ -173,7 +175,10 @@ fn moe_w1_mxfp4_swiglu_tc[
                     ((expert_id * N_raw_total + n_raw) * Kblocks) + kb
                 ]
                 var packed = w_blocks_ptr[
-                    (((expert_id * N_raw_total + n_raw) * Kblocks + kb) * BYTES_PER_BLOCK)
+                    (
+                        ((expert_id * N_raw_total + n_raw) * Kblocks + kb)
+                        * BYTES_PER_BLOCK
+                    )
                     + byte_in_block
                 ]
                 var v2 = decode_mxfp4_byte_to_2xbf16_e8m0(packed, scale_exp)
@@ -191,8 +196,10 @@ fn moe_w1_mxfp4_swiglu_tc[
 
         @parameter
         for mma_k in range(BK // MMA_K):
+
             @parameter
             for mma_m in range(WM // MMA_M):
+
                 @parameter
                 for mma_n in range(WN // MMA_N):
                     var c_tile = c_reg.tile[1, 4](mma_m, mma_n)
@@ -207,8 +214,10 @@ fn moe_w1_mxfp4_swiglu_tc[
 
     # Store warp accumulators into shared C tile.
     var C_warp = C_s.tile[WM, WN](Int(warp_y), Int(warp_x))
+
     @parameter
     for mma_m in range(WM // MMA_M):
+
         @parameter
         for mma_n in range(WN // MMA_N):
             var C_mma = C_warp.tile[MMA_M, MMA_N](mma_m, mma_n)
@@ -229,8 +238,12 @@ fn moe_w1_mxfp4_swiglu_tc[
             var col_raw0 = n_raw0 + raw0
             var col_raw1 = n_raw0 + raw1
 
-            var glu = C_s[r, raw0][0] + b_ptr[expert_id * N_raw_total + col_raw0]
-            var lin = C_s[r, raw1][0] + b_ptr[expert_id * N_raw_total + col_raw1]
+            var glu = (
+                C_s[r, raw0][0] + b_ptr[expert_id * N_raw_total + col_raw0]
+            )
+            var lin = (
+                C_s[r, raw1][0] + b_ptr[expert_id * N_raw_total + col_raw1]
+            )
 
             var y = swiglu_pair(glu, lin, alpha, limit)
             h_ptr.store(global_row * I + out_col, y.cast[BF16]())
@@ -272,28 +285,32 @@ fn moe_w2_mxfp4_scatter_tc[
     var seg_end = Int(expert_start_ptr[expert_id + 1])
     var row0 = seg_start + Int(block_idx.y) * BM
 
-    var token_ids_s = stack_allocation[BM, Scalar[U32], address_space=AddressSpace.SHARED]()
-    var gamma_s = stack_allocation[BM, Scalar[F32], address_space=AddressSpace.SHARED]()
+    var token_ids_s = stack_allocation[
+        BM, Scalar[U32], address_space = AddressSpace.SHARED
+    ]()
+    var gamma_s = stack_allocation[
+        BM, Scalar[F32], address_space = AddressSpace.SHARED
+    ]()
 
     var A_s = LayoutTensor[
         BF16,
         Layout.row_major(BM, BK),
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space = AddressSpace.SHARED,
     ].stack_allocation()
 
     var B_s = LayoutTensor[
         BF16,
         Layout.row_major(BK, BN),
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space = AddressSpace.SHARED,
     ].stack_allocation()
 
     var C_s = LayoutTensor[
         F32,
         Layout.row_major(BM, BN),
         MutAnyOrigin,
-        address_space=AddressSpace.SHARED,
+        address_space = AddressSpace.SHARED,
     ].stack_allocation()
 
     # Precompute token ids + gamma for the BM rows.
@@ -323,7 +340,7 @@ fn moe_w2_mxfp4_scatter_tc[
             F32,
             Layout.row_major(WM // MMA_M, (WN * 4) // MMA_N),
             MutAnyOrigin,
-            address_space=AddressSpace.LOCAL,
+            address_space = AddressSpace.LOCAL,
         ]
         .stack_allocation()
         .fill(0)
@@ -375,8 +392,10 @@ fn moe_w2_mxfp4_scatter_tc[
 
         @parameter
         for mma_k in range(BK // MMA_K):
+
             @parameter
             for mma_m in range(WM // MMA_M):
+
                 @parameter
                 for mma_n in range(WN // MMA_N):
                     var c_tile = c_reg.tile[1, 4](mma_m, mma_n)
@@ -391,8 +410,10 @@ fn moe_w2_mxfp4_scatter_tc[
 
     # Store to shared C tile
     var C_warp = C_s.tile[WM, WN](Int(warp_y), Int(warp_x))
+
     @parameter
     for mma_m in range(WM // MMA_M):
+
         @parameter
         for mma_n in range(WN // MMA_N):
             var C_mma = C_warp.tile[MMA_M, MMA_N](mma_m, mma_n)
@@ -447,7 +468,7 @@ struct MXFP4MoEW1SwiGlu:
         var I = n_raw_total // 2
 
         var grid_x = ceildiv(I, 32)  # BN_ACT = 32
-        var grid_y = ceildiv(P, 128) # BM = 128
+        var grid_y = ceildiv(P, 128)  # BM = 128
         var grid_z = num_experts
 
         var gpu_ctx = ctx.get_device_context()
@@ -540,7 +561,7 @@ struct MXFP4MoEW2Scatter:
         var num_experts = w_blocks.dim_size(0)
         var kblocks = w_blocks.dim_size(2)
 
-        var grid_x = ceildiv(D, 64)   # BN = 64
+        var grid_x = ceildiv(D, 64)  # BN = 64
         var grid_y = ceildiv(P, 128)  # BM = 128
         var grid_z = num_experts
 

@@ -14,7 +14,7 @@
 
 from buffer import Dim
 from buffer.dimlist import DimList
-from internal_utils import HostNDBuffer, zero
+from ndbuffer_utils import HostNDBuffer, zero
 from kernels.fp4_utils import E2M1_TO_FLOAT32, SF_MN_GROUP_SIZE
 from kernels.mxfp4 import (
     MXFP4_BLOCK_K,
@@ -88,7 +88,7 @@ fn make_scales_host[
     )
     var scales = HostNDBuffer[MXFP4_SF_DTYPE, 5, scale_shape](scale_shape)
     zero(scales.tensor)
-    return scales
+    return scales^
 
 
 fn fill_scales_constant[

@@ -122,10 +122,7 @@ fn decode_mxfp4_byte_to_2xbf16_e8m0(
 @always_inline
 fn decode_mxfp4_byte_to_2xf16[
     scale_dtype: DType,
-](
-    packed: Scalar[U8],
-    scale: Scalar[scale_dtype],
-) -> SIMD[F16, 2]:
+](packed: Scalar[U8], scale: Scalar[scale_dtype],) -> SIMD[F16, 2]:
     # Two FP4 values per byte (low/high nibble), scaled by the shared E8M0 scale.
     var lo = UInt8(packed) & 0x0F
     var hi = UInt8(packed) >> 4

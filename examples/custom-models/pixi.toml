@@ -10,6 +10,25 @@ version = "0.1.0"
 generate = "python -m max.entrypoints.pipelines generate --custom-architectures $PIXI_PROJECT_ROOT/gpt_oss_mxfp4 --model openai/gpt-oss-20b --max-length 10000 --prompt 'Why is the sky blue?'"
 serve = "python -m max.entrypoints.pipelines serve --custom-architectures $PIXI_PROJECT_ROOT/qwen2 --model Qwen/Qwen2.5-0.5B-Instruct"
 mxfp4-matmul-test = "PYTHONPATH=$PIXI_PROJECT_ROOT pytest $PIXI_PROJECT_ROOT/tests/test_mxfp4_matmul.py -q"
+mxfp4-bootstrap-test = "PYTHONPATH=$PIXI_PROJECT_ROOT pytest $PIXI_PROJECT_ROOT/tests/test_modular_home_bootstrap.py -q"
+mxfp4-moe-reference-test = "PYTHONPATH=$PIXI_PROJECT_ROOT pytest $PIXI_PROJECT_ROOT/tests/test_mxfp4_moe_reference.py -q"
+mxfp4-py-tests = { depends-on = [
+  "mxfp4-matmul-test",
+  "mxfp4-bootstrap-test",
+  "mxfp4-moe-reference-test",
+] }
+
+# Mojo tests (use Mojo runner; include `examples/custom_ops/` so `kernels.*` resolves).
+mxfp4-mojo-quant-layout-test = "mojo run -I $PIXI_PROJECT_ROOT/../custom_ops $PIXI_PROJECT_ROOT/tests/mojo/test_mxfp4_quant_layout.mojo"
+mxfp4-mojo-swiglu-math-test = "mojo run -I $PIXI_PROJECT_ROOT/../custom_ops $PIXI_PROJECT_ROOT/tests/mojo/test_mxfp4_swiglu_math.mojo"
+mxfp4-mojo-tests = { depends-on = [
+  "mxfp4-mojo-quant-layout-test",
+  "mxfp4-mojo-swiglu-math-test",
+] }
+
+# SM90-only Mojo tests (expected to run only on NVIDIA sm90+; currently under active development).
+mxfp4-mojo-sm90-clean-tile-test = "mojo run -I $PIXI_PROJECT_ROOT/../custom_ops $PIXI_PROJECT_ROOT/tests/mojo/test_mxfp4_sm90_clean_tile_wgmma.mojo"
+mxfp4-mojo-sm90-moe-test = "mojo run -I $PIXI_PROJECT_ROOT/../custom_ops $PIXI_PROJECT_ROOT/tests/mojo/test_mxfp4_moe_sm90.mojo"
 format = "PYTHONPATH=$PIXI_PROJECT_ROOT ruff format $PIXI_PROJECT_ROOT/gpt_oss_mxfp4"
 lint = "PYTHONPATH=$PIXI_PROJECT_ROOT ruff check --fix $PIXI_PROJECT_ROOT/gpt_oss_mxfp4"
 

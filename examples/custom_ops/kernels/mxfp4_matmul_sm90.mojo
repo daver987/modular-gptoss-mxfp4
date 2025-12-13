@@ -3,7 +3,7 @@
 # Correctness-first MXFP4 matmul + fused SwiGLU custom op.
 #
 # This is primarily used for debugging and CPU-side correctness testing.
-# Performance work should focus on the MoE kernels in `moe_mxfp4_kernels.mojo`.
+# Performance work should focus on the MoE kernels in `moe_mxfp4_ops.mojo`.
 
 import compiler
 from runtime.asyncrt import DeviceContextPtr
@@ -28,8 +28,8 @@ struct MXFP4MatmulSwiGlu:
     ](
         output: OutputTensor[rank=2],
         a: InputTensor[dtype = output.dtype, rank=2],
-        b_packed: InputTensor[dtype = U8, rank=3],
-        b_scales: InputTensor[dtype = F32, rank=2],
+        b_packed: InputTensor[dtype=U8, rank=3],
+        b_scales: InputTensor[dtype=F32, rank=2],
         bias: InputTensor[dtype = output.dtype, rank=1],
         alpha: Float32,
         limit: Float32,
@@ -93,11 +93,17 @@ struct MXFP4MatmulSwiGlu:
                         var packed_gate = b_packed[kb, col_gate, byte_idx][0]
                         var packed_up = b_packed[kb, col_up, byte_idx][0]
 
-                        var g2 = decode_mxfp4_byte_to_2xf16(packed_gate, scale_gate)
+                        var g2 = decode_mxfp4_byte_to_2xf16(
+                            packed_gate, scale_gate
+                        )
                         var u2 = decode_mxfp4_byte_to_2xf16(packed_up, scale_up)
 
-                        acc_gate += a0 * g2[0].cast[F32]() + a1 * g2[1].cast[F32]()
-                        acc_up += a0 * u2[0].cast[F32]() + a1 * u2[1].cast[F32]()
+                        acc_gate += (
+                            a0 * g2[0].cast[F32]() + a1 * g2[1].cast[F32]()
+                        )
+                        acc_up += (
+                            a0 * u2[0].cast[F32]() + a1 * u2[1].cast[F32]()
+                        )
 
                 # Bias + fused SwiGLU.
                 var gate_bias = bias[col_gate][0].cast[F32]()

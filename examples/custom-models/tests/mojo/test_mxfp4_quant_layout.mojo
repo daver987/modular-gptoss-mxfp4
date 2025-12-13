@@ -8,7 +8,7 @@
 
 from buffer import Dim
 from buffer.dimlist import DimList
-from internal_utils import HostNDBuffer
+from ndbuffer_utils import HostNDBuffer
 from kernels.fp4_utils import E2M1_TO_FLOAT32
 from kernels.mxfp4 import (
     dequant_row_cpu,

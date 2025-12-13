@@ -37,15 +37,17 @@ Risks:
 - [x] (2025-12-10 02:40Z) Added Python env scaffold under `examples/custom-models/pixi.toml` (deps + tasks) and initial integration tests under `examples/custom-models/tests/`.
 - [x] (2025-12-12 05:27Z) Reviewed `examples/custom_ops/kernels/moe_mxfp4_ops.mojo` against the Triton MoE path; confirmed high-level contracts match (remaining gaps are perf-only internals).
 - [x] (2025-12-13) Updated this ExecPlan to incorporate per-subdir pixi usage, the “Python adapts to Mojo” rule, and the actual registered Mojo op signatures/weight layouts in the current tree.
-- [ ] Implement Python wrappers + MoE layer wiring so the GPT-OSS MXFP4 architecture calls `mxfp4_moe_w1_swiglu` / `mxfp4_moe_w2_scatter`.
+- [x] (2025-12-13) Wired Python to the Mojo contracts: added wrappers (`gpt_oss_mxfp4/kernels.py`), switched MoE to call `mxfp4_moe_w1_swiglu`/`mxfp4_moe_w2_scatter`, added MXFP4 weight adapter, and ensured the pipeline graph loads custom ops via `custom_extensions`.
 - [ ] Implement the real SM90 kernel (decode-in-register + `wgmma`) inside the MoE ops (or in a new Mojo kernel file) **without changing the Python-visible op signatures**.
-- [ ] Add pixi tasks + run smoke validations (Mojo runner for Mojo tests; Python tests for integration).
+- [x] (2025-12-13) Added pixi tasks + ran smoke validations (Mojo runner for Mojo tests; Python tests for integration).
 
 ## Surprises & Discoveries
 
 - `pixi shell` is disruptive in this repo (can reset CWD to `/workspace`); use `pixi run --manifest-path <dir> ...` (or run from that directory) instead.
 - The dense debug op `gpt_oss.mxfp4.matmul.sm90` is CPU-only today; performance work must land in the GPU MoE ops and later the SM90 `wgmma` implementation.
 - The MoE ops already implement the correct *high-level* Triton behavior (routing → W1+SwiGLU → W2 scatter-add with gammas); the remaining work is internal performance engineering and Python architecture wiring.
+- Mojo test helpers in `examples/custom-models/tests/mojo/` used outdated `internal_utils.HostNDBuffer`/`DeviceNDBuffer`; replaced with a local `ndbuffer_utils.mojo` wrapper so tests run via `mojo run`.
+- In Mojo GPU tests, keep tiny routing metadata like `stats = [max_tokens, num_active_experts]` on the host; reading device-resident LayoutTensor scalars on the host can crash under KGEN.
 
 ## Decision Log
 
@@ -99,16 +101,17 @@ Environment sanity:
 
 Mojo tests (use Mojo runner):
 
-    # Run from `examples/custom-models/` so local imports resolve:
     cd examples/custom-models
-    pixi run mojo run tests/mojo/test_mxfp4_swiglu_math.mojo
+    pixi run mxfp4-mojo-tests
+
+    # SM90-only Mojo tests (optional; currently under active development)
+    pixi run mxfp4-mojo-sm90-clean-tile-test
+    pixi run mxfp4-mojo-sm90-moe-test
 
 Python integration tests (verify wrappers + custom op loading):
 
     cd examples/custom-models
-    pixi run mxfp4-matmul-test
-    PYTHONPATH=$PWD pixi run pytest -q tests/test_modular_home_bootstrap.py
-    PYTHONPATH=$PWD pixi run pytest -q tests/test_mxfp4_moe_reference.py
+    pixi run mxfp4-py-tests
 
 End-to-end smoke (once model wiring is in place):
 

@@ -14,7 +14,7 @@
 from buffer import Dim
 from buffer.dimlist import DimList
 from gpu.host import DeviceContext
-from internal_utils import DeviceNDBuffer, HostNDBuffer, zero
+from ndbuffer_utils import DeviceNDBuffer, HostNDBuffer, zero
 from kernels.moe_mxfp4 import (
     GroupedMXFP4Matmul,
     GroupedMXFP4MatmulSwiGLU,
@@ -210,10 +210,6 @@ fn test_mxfp4_sm90_tile_gemm_clean() raises:
     ctx.enqueue_copy(offsets_dev.buffer, offsets_host.tensor.data)
     var ids_dev = DeviceNDBuffer[DType.int32, 1, ids_shape](ids_shape, ctx=ctx)
     ctx.enqueue_copy(ids_dev.buffer, ids_host.tensor.data)
-    var stats_dev = DeviceNDBuffer[DType.uint32, 1, stats_shape](
-        stats_shape, ctx=ctx
-    )
-    ctx.enqueue_copy(stats_dev.buffer, stats_host.tensor.data)
     var out_dev = DeviceNDBuffer[DType.bfloat16, 2, out_shape](
         out_shape, ctx=ctx
     )
@@ -227,7 +223,7 @@ fn test_mxfp4_sm90_tile_gemm_clean() raises:
         from_ndbuffer_row_major(bias_dev.tensor),
         from_ndbuffer_row_major(offsets_dev.tensor),
         from_ndbuffer_row_major(ids_dev.tensor),
-        from_ndbuffer_row_major(stats_dev.tensor),
+        from_ndbuffer_row_major(stats_host.tensor),
         ctx,
     )
     var out_host = HostNDBuffer[DType.bfloat16, 2, out_shape](out_shape)
@@ -351,10 +347,6 @@ fn test_mxfp4_sm90_tile_gemm_tail_k() raises:
     ctx.enqueue_copy(offsets_dev.buffer, offsets_host.tensor.data)
     var ids_dev = DeviceNDBuffer[DType.int32, 1, ids_shape](ids_shape, ctx=ctx)
     ctx.enqueue_copy(ids_dev.buffer, ids_host.tensor.data)
-    var stats_dev = DeviceNDBuffer[DType.uint32, 1, stats_shape](
-        stats_shape, ctx=ctx
-    )
-    ctx.enqueue_copy(stats_dev.buffer, stats_host.tensor.data)
     var out_dev = DeviceNDBuffer[DType.bfloat16, 2, out_shape](
         out_shape, ctx=ctx
     )
@@ -368,7 +360,7 @@ fn test_mxfp4_sm90_tile_gemm_tail_k() raises:
         from_ndbuffer_row_major(bias_dev.tensor),
         from_ndbuffer_row_major(offsets_dev.tensor),
         from_ndbuffer_row_major(ids_dev.tensor),
-        from_ndbuffer_row_major(stats_dev.tensor),
+        from_ndbuffer_row_major(stats_host.tensor),
         ctx,
     )
 
@@ -516,10 +508,6 @@ fn test_mxfp4_sm90_grouped_gemm_routing() raises:
     ctx.enqueue_copy(offsets_dev.buffer, offsets_host.tensor.data)
     var ids_dev = DeviceNDBuffer[DType.int32, 1, ids_shape](ids_shape, ctx=ctx)
     ctx.enqueue_copy(ids_dev.buffer, ids_host.tensor.data)
-    var stats_dev = DeviceNDBuffer[DType.uint32, 1, stats_shape](
-        stats_shape, ctx=ctx
-    )
-    ctx.enqueue_copy(stats_dev.buffer, stats_host.tensor.data)
     var out_dev = DeviceNDBuffer[DType.bfloat16, 2, out_shape](
         out_shape, ctx=ctx
     )
@@ -533,7 +521,7 @@ fn test_mxfp4_sm90_grouped_gemm_routing() raises:
         from_ndbuffer_row_major(bias_dev.tensor),
         from_ndbuffer_row_major(offsets_dev.tensor),
         from_ndbuffer_row_major(ids_dev.tensor),
-        from_ndbuffer_row_major(stats_dev.tensor),
+        from_ndbuffer_row_major(stats_host.tensor),
         ctx,
     )
 
@@ -584,7 +572,7 @@ fn test_mxfp4_sm90_grouped_gemm_routing() raises:
         from_ndbuffer_row_major(bias_dev.tensor),
         from_ndbuffer_row_major(offsets_dev.tensor),
         from_ndbuffer_row_major(ids_dev.tensor),
-        from_ndbuffer_row_major(stats_dev.tensor),
+        from_ndbuffer_row_major(stats_host.tensor),
         ctx,
     )
 
@@ -748,10 +736,6 @@ fn test_mxfp4_sm90_grouped_swiglu_gate_up() raises:
     ctx.enqueue_copy(offsets_dev.buffer, offsets_host.tensor.data)
     var ids_dev = DeviceNDBuffer[DType.int32, 1, ids_shape](ids_shape, ctx=ctx)
     ctx.enqueue_copy(ids_dev.buffer, ids_host.tensor.data)
-    var stats_dev = DeviceNDBuffer[DType.uint32, 1, stats_shape](
-        stats_shape, ctx=ctx
-    )
-    ctx.enqueue_copy(stats_dev.buffer, stats_host.tensor.data)
     var out_dev = DeviceNDBuffer[DType.bfloat16, 2, out_shape](
         out_shape, ctx=ctx
     )
@@ -765,7 +749,7 @@ fn test_mxfp4_sm90_grouped_swiglu_gate_up() raises:
         from_ndbuffer_row_major(bias_dev.tensor),
         from_ndbuffer_row_major(offsets_dev.tensor),
         from_ndbuffer_row_major(ids_dev.tensor),
-        from_ndbuffer_row_major(stats_dev.tensor),
+        from_ndbuffer_row_major(stats_host.tensor),
         ctx,
     )
 
@@ -941,10 +925,6 @@ fn test_mxfp4_sm90_k_loop_multi_tile() raises:
     ctx.enqueue_copy(offsets_dev.buffer, offsets_host.tensor.data)
     var ids_dev = DeviceNDBuffer[DType.int32, 1, ids_shape](ids_shape, ctx=ctx)
     ctx.enqueue_copy(ids_dev.buffer, ids_host.tensor.data)
-    var stats_dev = DeviceNDBuffer[DType.uint32, 1, stats_shape](
-        stats_shape, ctx=ctx
-    )
-    ctx.enqueue_copy(stats_dev.buffer, stats_host.tensor.data)
     var out_dev = DeviceNDBuffer[DType.bfloat16, 2, out_shape](
         out_shape, ctx=ctx
     )
@@ -958,7 +938,7 @@ fn test_mxfp4_sm90_k_loop_multi_tile() raises:
         from_ndbuffer_row_major(bias_dev.tensor),
         from_ndbuffer_row_major(offsets_dev.tensor),
         from_ndbuffer_row_major(ids_dev.tensor),
-        from_ndbuffer_row_major(stats_dev.tensor),
+        from_ndbuffer_row_major(stats_host.tensor),
         ctx,
     )
 
