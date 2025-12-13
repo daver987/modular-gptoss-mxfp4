@@ -4,6 +4,7 @@ import os
 import torch
 from safetensors import safe_open
 
+
 # Bytes per MXFP4 block: 32 FP4 numbers packed in 16 bytes
 BYTES_PER_BLOCK = 16
 
@@ -52,7 +53,7 @@ class Checkpoint:
         tensor_name_to_file = {}
         for safetensor_file in safetensor_files:
             with safe_open(safetensor_file, framework="pt", device=device_str) as f:
-                for key in f:
+                for key in f.keys():
                     tensor_name_to_file[key] = safetensor_file
 
         self.tensor_name_to_file = tensor_name_to_file
@@ -115,3 +116,23 @@ class Checkpoint:
             del idx_lo, idx_hi, blk, exp
 
         return out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
+
+    def _get_mxfp4_tensor_copy(self, blocks_name: str, scales_name: str, dtype: torch.dtype = torch.bfloat16):
+        "short version that uses a lot of memory"
+
+        loaded_blocks = self._get_tensor(blocks_name)
+        # Split it into low and high nibbles, upcast to bytes, and interleave (for swiglu)
+        loaded_blocks_lo = loaded_blocks & 0x0F
+        loaded_blocks_hi = loaded_blocks >> 4
+        loaded_blocks = torch.stack((loaded_blocks_lo, loaded_blocks_hi), dim=-1)
+        loaded_blocks = loaded_blocks.view(*loaded_blocks.shape[:-2], loaded_blocks.shape[-2] * 2)
+
+        loaded_scales = self._get_tensor(scales_name)
+        # Upcast to int32 and subtract bias
+        loaded_scales = loaded_scales.int() - 127
+
+        # Convert MXFP4 numbers into target dtype
+        fp4_values = torch.tensor(FP4_VALUES, dtype=dtype, device=self.device_str)
+        loaded_tensor = torch.ldexp(fp4_values[loaded_blocks.int()], loaded_scales.unsqueeze(-1))
+        loaded_tensor = loaded_tensor.view(*loaded_tensor.shape[:-2], -1)
+        return loaded_tensor

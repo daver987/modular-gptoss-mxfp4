@@ -7,9 +7,14 @@ platforms = ["osx-arm64", "linux-aarch64", "linux-64"]
 version = "0.1.0"
 
 [tasks]
-generate = "python -m max.entrypoints.pipelines generate --custom-architectures qwen2 --model Qwen/Qwen2.5-0.5B-Instruct --max-length 10000 --prompt 'Why is the sky blue?'"
-serve = "python -m max.entrypoints.pipelines serve --custom-architectures qwen2 --model Qwen/Qwen2.5-0.5B-Instruct"
+generate = "python -m max.entrypoints.pipelines generate --custom-architectures $PIXI_PROJECT_ROOT/gpt_oss_mxfp4 --model openai/gpt-oss-20b --max-length 10000 --prompt 'Why is the sky blue?'"
+serve = "python -m max.entrypoints.pipelines serve --custom-architectures $PIXI_PROJECT_ROOT/qwen2 --model Qwen/Qwen2.5-0.5B-Instruct"
+mxfp4-matmul-test = "PYTHONPATH=$PIXI_PROJECT_ROOT pytest $PIXI_PROJECT_ROOT/gpt_oss_mxfp4/tests/test_mxfp4_matmul.py -q"
 
 [dependencies]
 python = ">=3.9,<3.14"
 modular = ">=26.1.0.dev2025120907,<27"
+pytest = ">=8.3.3"
+numpy = ">=1.26"
+safetensors = ">=0.7.0,<0.8"
+ruff = ">=0.14.8,<0.15"

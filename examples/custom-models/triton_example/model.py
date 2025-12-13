@@ -3,12 +3,11 @@ import math
 import os
 
 import torch
-from torch.profiler import record_function
-
 from gpt_oss.torch.model import ModelConfig, RMSNorm
 from gpt_oss.torch.weights import Checkpoint
 from gpt_oss.triton.attention import attention, attention_ref
-from gpt_oss.triton.moe import quantize_mx4, moe
+from gpt_oss.triton.moe import moe, quantize_mx4
+from torch.profiler import record_function
 
 
 class RotaryEmbedding(torch.nn.Module):
