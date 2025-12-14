@@ -8,7 +8,10 @@ version = "0.1.0"
 
 [tasks]
 generate = "python -m max.entrypoints.pipelines generate --custom-architectures $PIXI_PROJECT_ROOT/gpt_oss_mxfp4 --model openai/gpt-oss-20b --max-length 10000 --prompt 'Why is the sky blue?'"
-serve = "python -m max.entrypoints.pipelines serve --custom-architectures $PIXI_PROJECT_ROOT/qwen2 --model Qwen/Qwen2.5-0.5B-Instruct"
+generate-smoke = "python -m max.entrypoints.pipelines generate --custom-architectures $PIXI_PROJECT_ROOT/gpt_oss_mxfp4 --model openai/gpt-oss-20b --max-length 2048 --prompt 'Say hello in one sentence.'"
+generate-smoke-prof = "python -m max.entrypoints.pipelines generate --custom-architectures $PIXI_PROJECT_ROOT/gpt_oss_mxfp4 --model openai/gpt-oss-20b --max-length 2048 --prompt 'Say hello in one sentence.' --gpu-profiling detailed"
+serve = "python -m max.entrypoints.pipelines serve --custom-architectures $PIXI_PROJECT_ROOT/gpt_oss_mxfp4 --model openai/gpt-oss-20b"
+serve-prof = "python -m max.entrypoints.pipelines serve --custom-architectures $PIXI_PROJECT_ROOT/gpt_oss_mxfp4 --model openai/gpt-oss-20b --gpu-profiling detailed"
 mxfp4-matmul-test = "PYTHONPATH=$PIXI_PROJECT_ROOT pytest $PIXI_PROJECT_ROOT/tests/test_mxfp4_matmul.py -q"
 mxfp4-bootstrap-test = "PYTHONPATH=$PIXI_PROJECT_ROOT pytest $PIXI_PROJECT_ROOT/tests/test_modular_home_bootstrap.py -q"
 mxfp4-moe-reference-test = "PYTHONPATH=$PIXI_PROJECT_ROOT pytest $PIXI_PROJECT_ROOT/tests/test_mxfp4_moe_reference.py -q"
