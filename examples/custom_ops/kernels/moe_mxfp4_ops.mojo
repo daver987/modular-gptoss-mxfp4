@@ -19,9 +19,15 @@ from os import Atomic
 
 import compiler
 from gpu import barrier, block_dim, block_idx, thread_idx, warp_id
-from gpu.host import DeviceBuffer
+from gpu.host import DeviceBuffer, FuncAttribute
 from gpu.host.info import is_cpu
-from gpu.memory import AddressSpace
+from gpu.memory import (
+    AddressSpace,
+    async_copy,
+    async_copy_commit_group,
+    async_copy_wait_all,
+    external_memory,
+)
 from layout.layout_tensor import Layout, LayoutTensor
 from layout.tensor_core import TensorCore
 from layout.tensor_core_async import (
@@ -47,6 +53,7 @@ comptime F16 = DType.float16
 comptime F32 = DType.float32
 comptime U8 = DType.uint8
 comptime U32 = DType.uint32
+comptime U64 = DType.uint64
 comptime I32 = DType.int32
 
 comptime BYTES_PER_BLOCK = 16
@@ -62,6 +69,7 @@ fn moe_w1_mxfp4_swiglu_wgmma[
     WGMMA_M: Int = 64,
     WGMMA_N: Int = 64,
     WGMMA_K: Int = 16,
+    NUM_WARP_GROUPS: Int = 1,
 ](
     x_ptr: UnsafePointer[BFloat16, MutAnyOrigin],
     T: Int,
@@ -87,6 +95,7 @@ fn moe_w1_mxfp4_swiglu_wgmma[
     constrained[BN_RAW % WGMMA_N == 0]()
     constrained[BK % WGMMA_K == 0]()
     constrained[BK % VALUES_PER_BLOCK == 0, "BK must be a multiple of 32"]()
+    constrained[BM % (WGMMA_M * NUM_WARP_GROUPS) == 0]()
 
     var expert_idx = Int(block_idx.z)
     if expert_idx >= num_active_experts:
@@ -99,6 +108,9 @@ fn moe_w1_mxfp4_swiglu_wgmma[
     var n_tile_act = Int(block_idx.x)
     var n_act0 = n_tile_act * (BN_RAW // 2)
     var n_raw0 = n_tile_act * BN_RAW
+
+    var wg_idx = Int(thread_idx.x) >> 7
+    var warp_in_wg = Int(warp_id() & UInt(3))
 
     var seg_start = Int(expert_start_ptr[expert_idx])
     var seg_end = Int(expert_start_ptr[expert_idx + 1])
@@ -117,41 +129,90 @@ fn moe_w1_mxfp4_swiglu_wgmma[
             token_ids_s[r] = UInt32(0)
     barrier()
 
+    comptime blocks_per_tile = BK // VALUES_PER_BLOCK
+
     # Shared tiles in WGMMA-friendly layouts.
+    #
+    # Use dynamic shared memory for the 2-stage pipeline so we can exceed the
+    # 48KB static shared memory limit (needed for BM=128/BN=128).
     comptime a_smem_layout = tile_layout_k_major[BF16, BM, BK]()
+    comptime b_smem_layout = tile_layout_k_major[BF16, BN_RAW, BK]()
+
+    comptime a_bytes = a_smem_layout.size() * 2  # BF16 = 2 bytes
+    comptime b_bytes = b_smem_layout.size() * 2  # BF16 = 2 bytes
+    comptime a1_off = ((a_bytes + 255) // 256) * 256
+    comptime b0_off = ((a1_off + a_bytes + 255) // 256) * 256
+    comptime b1_off = ((b0_off + b_bytes + 255) // 256) * 256
+    comptime pack_bytes = BN_RAW * blocks_per_tile * BYTES_PER_BLOCK
+    comptime scale_bytes = BN_RAW * blocks_per_tile
+    comptime pack0_off = ((b1_off + b_bytes + 255) // 256) * 256
+    comptime pack1_off = ((pack0_off + pack_bytes + 255) // 256) * 256
+    comptime scale0_off = ((pack1_off + pack_bytes + 255) // 256) * 256
+    comptime scale1_off = ((scale0_off + scale_bytes + 255) // 256) * 256
+
+    var smem = external_memory[
+        Scalar[U8],
+        address_space = AddressSpace.SHARED,
+        alignment=256,
+        name="moe_mxfp4_w1_dynamic_smem",
+    ]()
+    var smem_ptr = smem.address_space_cast[AddressSpace.SHARED]().mut_cast[
+        True
+    ]()
+
     var A_s0 = LayoutTensor[
         BF16,
         a_smem_layout,
         MutAnyOrigin,
         address_space = AddressSpace.SHARED,
-        alignment=128,
-    ].stack_allocation()
+        alignment=256,
+    ](smem_ptr.bitcast[Scalar[BF16]]())
     var A_s1 = LayoutTensor[
         BF16,
         a_smem_layout,
         MutAnyOrigin,
         address_space = AddressSpace.SHARED,
-        alignment=128,
-    ].stack_allocation()
+        alignment=256,
+    ]((smem_ptr + a1_off).bitcast[Scalar[BF16]]())
 
     # B is stored as [N, K] (transpose_b=True) for WGMMA.
-    comptime b_smem_layout = tile_layout_k_major[BF16, BN_RAW, BK]()
     var B_s0 = LayoutTensor[
         BF16,
         b_smem_layout,
         MutAnyOrigin,
         address_space = AddressSpace.SHARED,
-        alignment=128,
-    ].stack_allocation()
+        alignment=256,
+    ]((smem_ptr + b0_off).bitcast[Scalar[BF16]]())
     var B_s1 = LayoutTensor[
         BF16,
         b_smem_layout,
         MutAnyOrigin,
         address_space = AddressSpace.SHARED,
-        alignment=128,
-    ].stack_allocation()
+        alignment=256,
+    ]((smem_ptr + b1_off).bitcast[Scalar[BF16]]())
 
-    comptime num_m_mmas = BM // WGMMA_M
+    # Packed MXFP4 staging buffers: [BN_RAW * (BK/32) blocks] * 16 bytes.
+    var B_pack0 = smem_ptr + pack0_off
+    var B_pack1 = smem_ptr + pack1_off
+    var B_scale0 = smem_ptr + scale0_off
+    var B_scale1 = smem_ptr + scale1_off
+
+    var w_blocks_u8 = w_blocks_ptr.address_space_cast[
+        AddressSpace.GLOBAL
+    ]().bitcast[Scalar[U8]]()
+    var B_pack0_u64 = (
+        B_pack0.bitcast[Scalar[U64]]()
+        .address_space_cast[AddressSpace.SHARED]()
+        .mut_cast[True]()
+    )
+    var B_pack1_u64 = (
+        B_pack1.bitcast[Scalar[U64]]()
+        .address_space_cast[AddressSpace.SHARED]()
+        .mut_cast[True]()
+    )
+
+    comptime num_m_mmas_total = BM // WGMMA_M
+    comptime num_m_mmas = num_m_mmas_total // NUM_WARP_GROUPS
     comptime num_n_mmas = BN_RAW // WGMMA_N
     comptime c_frag_size = (WGMMA_M * WGMMA_N) // 128
 
@@ -174,10 +235,41 @@ fn moe_w1_mxfp4_swiglu_wgmma[
         transpose_b=True,
     ]()
 
-    comptime blocks_per_tile = BK // VALUES_PER_BLOCK
     comptime a_chunks = BK // 4
 
     # Preload first K tile into buffer 0.
+    var kb0 = 0
+    for idx in range(
+        Int(thread_idx.x),
+        BN_RAW * blocks_per_tile,
+        Int(block_dim.x),
+    ):
+        var c = idx // blocks_per_tile
+        var block_in_tile = idx - c * blocks_per_tile
+        var n_raw = n_raw0 + c
+        var kb = kb0 + block_in_tile
+
+        if n_raw < N_raw_total and kb < Kblocks:
+            var scale_exp = w_scales_ptr[
+                ((expert_id * N_raw_total + n_raw) * Kblocks) + kb
+            ]
+            B_scale0[idx] = scale_exp
+
+            var packed_base = (
+                (expert_id * N_raw_total + n_raw) * Kblocks + kb
+            ) * BYTES_PER_BLOCK
+            async_copy[16](
+                w_blocks_u8 + packed_base,
+                B_pack0 + idx * BYTES_PER_BLOCK,
+            )
+        else:
+            B_scale0[idx] = 0
+            var base_u64 = idx * 2
+            B_pack0_u64.store[alignment=8](base_u64 + 0, Scalar[U64](0))
+            B_pack0_u64.store[alignment=8](base_u64 + 1, Scalar[U64](0))
+
+    async_copy_commit_group()
+
     for idx in range(Int(thread_idx.x), BM * a_chunks, Int(block_dim.x)):
         var r = idx // a_chunks
         var chunk = idx - r * a_chunks
@@ -215,7 +307,8 @@ fn moe_w1_mxfp4_swiglu_wgmma[
                 else:
                     A_s0[r, kk + i] = 0
 
-    var kb0 = 0
+    async_copy_wait_all()
+
     for idx in range(
         Int(thread_idx.x),
         BN_RAW * blocks_per_tile,
@@ -223,49 +316,35 @@ fn moe_w1_mxfp4_swiglu_wgmma[
     ):
         var c = idx // blocks_per_tile
         var block_in_tile = idx - c * blocks_per_tile
-        var n_raw = n_raw0 + c
-        var kb = kb0 + block_in_tile
+        var scale = e8m0_to_f32(B_scale0[idx])
 
-        if n_raw < N_raw_total and kb < Kblocks:
-            var scale_exp = w_scales_ptr[
-                ((expert_id * N_raw_total + n_raw) * Kblocks) + kb
-            ]
-            var packed_base = (
-                (expert_id * N_raw_total + n_raw) * Kblocks + kb
-            ) * BYTES_PER_BLOCK
+        var base_u64 = idx * 2
+        var packed0 = bitcast[DType.uint8, 8](
+            UInt64(B_pack0_u64.load[alignment=8](base_u64 + 0))
+        )
+        var packed1 = bitcast[DType.uint8, 8](
+            UInt64(B_pack0_u64.load[alignment=8](base_u64 + 1))
+        )
 
-            var packed_ptr64 = rebind[UnsafePointer[UInt64, MutAnyOrigin]](
-                w_blocks_ptr + packed_base
+        @parameter
+        for byte_in_block in range(8):
+            var r0 = block_in_tile * VALUES_PER_BLOCK + byte_in_block * 2
+            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                packed0[byte_in_block], scale
             )
-            var packed0 = bitcast[DType.uint8, 8](packed_ptr64[0])
-            var packed1 = bitcast[DType.uint8, 8](packed_ptr64[1])
-            var scale = e8m0_to_f32(scale_exp)
+            B_s0[c, r0 + 0] = v2[0]
+            B_s0[c, r0 + 1] = v2[1]
 
-            @parameter
-            for byte_in_block in range(8):
-                var r0 = block_in_tile * VALUES_PER_BLOCK + byte_in_block * 2
-                var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                    packed0[byte_in_block], scale
-                )
-                B_s0[c, r0 + 0] = v2[0]
-                B_s0[c, r0 + 1] = v2[1]
+        @parameter
+        for byte_in_block in range(8):
+            var byte = byte_in_block + 8
+            var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
+            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                packed1[byte_in_block], scale
+            )
+            B_s0[c, r0 + 0] = v2[0]
+            B_s0[c, r0 + 1] = v2[1]
 
-            @parameter
-            for byte_in_block in range(8):
-                var byte = byte_in_block + 8
-                var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
-                var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                    packed1[byte_in_block], scale
-                )
-                B_s0[c, r0 + 0] = v2[0]
-                B_s0[c, r0 + 1] = v2[1]
-        else:
-
-            @parameter
-            for byte_in_block in range(BYTES_PER_BLOCK):
-                var r0 = block_in_tile * VALUES_PER_BLOCK + byte_in_block * 2
-                B_s0[c, r0 + 0] = 0
-                B_s0[c, r0 + 1] = 0
     barrier()
 
     var num_k_tiles = ceildiv(D, BK)
@@ -275,12 +354,18 @@ fn moe_w1_mxfp4_swiglu_wgmma[
         warpgroup_fence(c_reg_tile)
         wgmma.arrive()
         if use_buf0:
-            wgmma.wgmma(
-                a_smem_tile=A_s0, b_smem_tile=B_s0, c_reg_tile=c_reg_tile
+            wgmma.wgmma[num_warp_groups=NUM_WARP_GROUPS](
+                a_smem_tile=A_s0,
+                b_smem_tile=B_s0,
+                c_reg_tile=c_reg_tile,
+                wg_idx=wg_idx,
             )
         else:
-            wgmma.wgmma(
-                a_smem_tile=A_s1, b_smem_tile=B_s1, c_reg_tile=c_reg_tile
+            wgmma.wgmma[num_warp_groups=NUM_WARP_GROUPS](
+                a_smem_tile=A_s1,
+                b_smem_tile=B_s1,
+                c_reg_tile=c_reg_tile,
+                wg_idx=wg_idx,
             )
         wgmma.commit_group()
         warpgroup_fence(c_reg_tile)
@@ -295,6 +380,41 @@ fn moe_w1_mxfp4_swiglu_wgmma[
 
             if use_buf0:
                 # Load next tile into buffer 1.
+                for idx in range(
+                    Int(thread_idx.x),
+                    BN_RAW * blocks_per_tile,
+                    Int(block_dim.x),
+                ):
+                    var c = idx // blocks_per_tile
+                    var block_in_tile = idx - c * blocks_per_tile
+                    var n_raw = n_raw0 + c
+                    var kb = kb0_next + block_in_tile
+
+                    if n_raw < N_raw_total and kb < Kblocks:
+                        var scale_exp = w_scales_ptr[
+                            ((expert_id * N_raw_total + n_raw) * Kblocks) + kb
+                        ]
+                        B_scale1[idx] = scale_exp
+
+                        var packed_base = (
+                            (expert_id * N_raw_total + n_raw) * Kblocks + kb
+                        ) * BYTES_PER_BLOCK
+                        async_copy[16](
+                            w_blocks_u8 + packed_base,
+                            B_pack1 + idx * BYTES_PER_BLOCK,
+                        )
+                    else:
+                        B_scale1[idx] = 0
+                        var base_u64 = idx * 2
+                        B_pack1_u64.store[alignment=8](
+                            base_u64 + 0, Scalar[U64](0)
+                        )
+                        B_pack1_u64.store[alignment=8](
+                            base_u64 + 1, Scalar[U64](0)
+                        )
+
+                async_copy_commit_group()
+
                 for idx in range(
                     Int(thread_idx.x), BM * a_chunks, Int(block_dim.x)
                 ):
@@ -342,6 +462,48 @@ fn moe_w1_mxfp4_swiglu_wgmma[
                             else:
                                 A_s1[r, kk + i] = 0
 
+                async_copy_wait_all()
+
+                for idx in range(
+                    Int(thread_idx.x),
+                    BN_RAW * blocks_per_tile,
+                    Int(block_dim.x),
+                ):
+                    var c = idx // blocks_per_tile
+                    var block_in_tile = idx - c * blocks_per_tile
+                    var scale = e8m0_to_f32(B_scale1[idx])
+
+                    var base_u64 = idx * 2
+                    var packed0 = bitcast[DType.uint8, 8](
+                        UInt64(B_pack1_u64.load[alignment=8](base_u64 + 0))
+                    )
+                    var packed1 = bitcast[DType.uint8, 8](
+                        UInt64(B_pack1_u64.load[alignment=8](base_u64 + 1))
+                    )
+
+                    @parameter
+                    for byte_in_block in range(8):
+                        var r0 = (
+                            block_in_tile * VALUES_PER_BLOCK + byte_in_block * 2
+                        )
+                        var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                            packed0[byte_in_block], scale
+                        )
+                        B_s1[c, r0 + 0] = v2[0]
+                        B_s1[c, r0 + 1] = v2[1]
+
+                    @parameter
+                    for byte_in_block in range(8):
+                        var byte = byte_in_block + 8
+                        var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
+                        var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                            packed1[byte_in_block], scale
+                        )
+                        B_s1[c, r0 + 0] = v2[0]
+                        B_s1[c, r0 + 1] = v2[1]
+                barrier()
+            else:
+                # Load next tile into buffer 0.
                 for idx in range(
                     Int(thread_idx.x),
                     BN_RAW * blocks_per_tile,
@@ -356,50 +518,27 @@ fn moe_w1_mxfp4_swiglu_wgmma[
                         var scale_exp = w_scales_ptr[
                             ((expert_id * N_raw_total + n_raw) * Kblocks) + kb
                         ]
+                        B_scale0[idx] = scale_exp
+
                         var packed_base = (
                             (expert_id * N_raw_total + n_raw) * Kblocks + kb
                         ) * BYTES_PER_BLOCK
-
-                        var packed_ptr64 = rebind[
-                            UnsafePointer[UInt64, MutAnyOrigin]
-                        ](w_blocks_ptr + packed_base)
-                        var packed0 = bitcast[DType.uint8, 8](packed_ptr64[0])
-                        var packed1 = bitcast[DType.uint8, 8](packed_ptr64[1])
-                        var scale = e8m0_to_f32(scale_exp)
-
-                        @parameter
-                        for byte_in_block in range(8):
-                            var r0 = (
-                                block_in_tile * VALUES_PER_BLOCK
-                                + byte_in_block * 2
-                            )
-                            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                                packed0[byte_in_block], scale
-                            )
-                            B_s1[c, r0 + 0] = v2[0]
-                            B_s1[c, r0 + 1] = v2[1]
-
-                        @parameter
-                        for byte_in_block in range(8):
-                            var byte = byte_in_block + 8
-                            var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
-                            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                                packed1[byte_in_block], scale
-                            )
-                            B_s1[c, r0 + 0] = v2[0]
-                            B_s1[c, r0 + 1] = v2[1]
+                        async_copy[16](
+                            w_blocks_u8 + packed_base,
+                            B_pack0 + idx * BYTES_PER_BLOCK,
+                        )
                     else:
+                        B_scale0[idx] = 0
+                        var base_u64 = idx * 2
+                        B_pack0_u64.store[alignment=8](
+                            base_u64 + 0, Scalar[U64](0)
+                        )
+                        B_pack0_u64.store[alignment=8](
+                            base_u64 + 1, Scalar[U64](0)
+                        )
 
-                        @parameter
-                        for byte_in_block in range(BYTES_PER_BLOCK):
-                            var r0 = (
-                                block_in_tile * VALUES_PER_BLOCK
-                                + byte_in_block * 2
-                            )
-                            B_s1[c, r0 + 0] = 0
-                            B_s1[c, r0 + 1] = 0
-            else:
-                # Load next tile into buffer 0.
+                async_copy_commit_group()
+
                 for idx in range(
                     Int(thread_idx.x), BM * a_chunks, Int(block_dim.x)
                 ):
@@ -447,6 +586,8 @@ fn moe_w1_mxfp4_swiglu_wgmma[
                             else:
                                 A_s0[r, kk + i] = 0
 
+                async_copy_wait_all()
+
                 for idx in range(
                     Int(thread_idx.x),
                     BN_RAW * blocks_per_tile,
@@ -454,57 +595,39 @@ fn moe_w1_mxfp4_swiglu_wgmma[
                 ):
                     var c = idx // blocks_per_tile
                     var block_in_tile = idx - c * blocks_per_tile
-                    var n_raw = n_raw0 + c
-                    var kb = kb0_next + block_in_tile
+                    var scale = e8m0_to_f32(B_scale0[idx])
 
-                    if n_raw < N_raw_total and kb < Kblocks:
-                        var scale_exp = w_scales_ptr[
-                            ((expert_id * N_raw_total + n_raw) * Kblocks) + kb
-                        ]
-                        var packed_base = (
-                            (expert_id * N_raw_total + n_raw) * Kblocks + kb
-                        ) * BYTES_PER_BLOCK
+                    var base_u64 = idx * 2
+                    var packed0 = bitcast[DType.uint8, 8](
+                        UInt64(B_pack0_u64.load[alignment=8](base_u64 + 0))
+                    )
+                    var packed1 = bitcast[DType.uint8, 8](
+                        UInt64(B_pack0_u64.load[alignment=8](base_u64 + 1))
+                    )
 
-                        var packed_ptr64 = rebind[
-                            UnsafePointer[UInt64, MutAnyOrigin]
-                        ](w_blocks_ptr + packed_base)
-                        var packed0 = bitcast[DType.uint8, 8](packed_ptr64[0])
-                        var packed1 = bitcast[DType.uint8, 8](packed_ptr64[1])
-                        var scale = e8m0_to_f32(scale_exp)
+                    @parameter
+                    for byte_in_block in range(8):
+                        var r0 = (
+                            block_in_tile * VALUES_PER_BLOCK + byte_in_block * 2
+                        )
+                        var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                            packed0[byte_in_block], scale
+                        )
+                        B_s0[c, r0 + 0] = v2[0]
+                        B_s0[c, r0 + 1] = v2[1]
 
-                        @parameter
-                        for byte_in_block in range(8):
-                            var r0 = (
-                                block_in_tile * VALUES_PER_BLOCK
-                                + byte_in_block * 2
-                            )
-                            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                                packed0[byte_in_block], scale
-                            )
-                            B_s0[c, r0 + 0] = v2[0]
-                            B_s0[c, r0 + 1] = v2[1]
+                    @parameter
+                    for byte_in_block in range(8):
+                        var byte = byte_in_block + 8
+                        var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
+                        var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                            packed1[byte_in_block], scale
+                        )
+                        B_s0[c, r0 + 0] = v2[0]
+                        B_s0[c, r0 + 1] = v2[1]
+                barrier()
 
-                        @parameter
-                        for byte_in_block in range(8):
-                            var byte = byte_in_block + 8
-                            var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
-                            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                                packed1[byte_in_block], scale
-                            )
-                            B_s0[c, r0 + 0] = v2[0]
-                            B_s0[c, r0 + 1] = v2[1]
-                    else:
-
-                        @parameter
-                        for byte_in_block in range(BYTES_PER_BLOCK):
-                            var r0 = (
-                                block_in_tile * VALUES_PER_BLOCK
-                                + byte_in_block * 2
-                            )
-                            B_s0[c, r0 + 0] = 0
-                            B_s0[c, r0 + 1] = 0
-
-            barrier()
+            # Next iteration can proceed after B_s0/B_s1 is decoded.
 
     # Ensure all WGMMA groups are complete before the epilogue.
     wgmma.wait_group()
@@ -531,7 +654,10 @@ fn moe_w1_mxfp4_swiglu_wgmma[
             for r_it in range(row_iters):
                 var row_in_warp = lane_row + r_it * 8
                 var row_in_cta = (
-                    m_mma * WGMMA_M + Int(warp_id()) * warp_rows + row_in_warp
+                    wg_idx * (num_m_mmas * WGMMA_M)
+                    + m_mma * WGMMA_M
+                    + warp_in_wg * warp_rows
+                    + row_in_warp
                 )
                 var global_row = row0 + row_in_cta
                 if global_row >= seg_end or global_row >= P:
@@ -967,6 +1093,7 @@ fn moe_w2_mxfp4_scatter_wgmma[
     WGMMA_M: Int = 64,
     WGMMA_N: Int = 64,
     WGMMA_K: Int = 16,
+    NUM_WARP_GROUPS: Int = 1,
 ](
     h_ptr: UnsafePointer[BFloat16, MutAnyOrigin],
     P: Int,
@@ -990,6 +1117,7 @@ fn moe_w2_mxfp4_scatter_wgmma[
     constrained[BN % WGMMA_N == 0]()
     constrained[BK % WGMMA_K == 0]()
     constrained[BK % VALUES_PER_BLOCK == 0, "BK must be a multiple of 32"]()
+    constrained[BM % (WGMMA_M * NUM_WARP_GROUPS) == 0]()
 
     var expert_idx = Int(block_idx.z)
     if expert_idx >= num_active_experts:
@@ -998,6 +1126,9 @@ fn moe_w2_mxfp4_scatter_wgmma[
     var expert_id = Int(expert_ids_ptr[expert_idx])
     if expert_id < 0:
         return
+
+    var wg_idx = Int(thread_idx.x) >> 7
+    var warp_in_wg = Int(warp_id() & UInt(3))
 
     var n0 = Int(block_idx.x) * BN
 
@@ -1025,39 +1156,87 @@ fn moe_w2_mxfp4_scatter_wgmma[
     barrier()
 
     # Shared tiles in WGMMA-friendly layouts.
+    #
+    # Use dynamic shared memory for the 2-stage pipeline so we can exceed the
+    # 48KB static shared memory limit (needed for BM=128/BN=128).
     comptime a_smem_layout = tile_layout_k_major[BF16, BM, BK]()
+    comptime b_smem_layout = tile_layout_k_major[BF16, BN, BK]()
+    comptime blocks_per_tile = BK // VALUES_PER_BLOCK
+
+    comptime a_bytes = a_smem_layout.size() * 2  # BF16 = 2 bytes
+    comptime b_bytes = b_smem_layout.size() * 2  # BF16 = 2 bytes
+    comptime a1_off = ((a_bytes + 255) // 256) * 256
+    comptime b0_off = ((a1_off + a_bytes + 255) // 256) * 256
+    comptime b1_off = ((b0_off + b_bytes + 255) // 256) * 256
+    comptime pack_bytes = BN * blocks_per_tile * BYTES_PER_BLOCK
+    comptime scale_bytes = BN * blocks_per_tile
+    comptime pack0_off = ((b1_off + b_bytes + 255) // 256) * 256
+    comptime pack1_off = ((pack0_off + pack_bytes + 255) // 256) * 256
+    comptime scale0_off = ((pack1_off + pack_bytes + 255) // 256) * 256
+    comptime scale1_off = ((scale0_off + scale_bytes + 255) // 256) * 256
+
+    var smem = external_memory[
+        Scalar[U8],
+        address_space = AddressSpace.SHARED,
+        alignment=256,
+        name="moe_mxfp4_w2_dynamic_smem",
+    ]()
+    var smem_ptr = smem.address_space_cast[AddressSpace.SHARED]().mut_cast[
+        True
+    ]()
+
     var A_s0 = LayoutTensor[
         BF16,
         a_smem_layout,
         MutAnyOrigin,
         address_space = AddressSpace.SHARED,
-        alignment=128,
-    ].stack_allocation()
+        alignment=256,
+    ](smem_ptr.bitcast[Scalar[BF16]]())
     var A_s1 = LayoutTensor[
         BF16,
         a_smem_layout,
         MutAnyOrigin,
         address_space = AddressSpace.SHARED,
-        alignment=128,
-    ].stack_allocation()
+        alignment=256,
+    ]((smem_ptr + a1_off).bitcast[Scalar[BF16]]())
 
-    comptime b_smem_layout = tile_layout_k_major[BF16, BN, BK]()
     var B_s0 = LayoutTensor[
         BF16,
         b_smem_layout,
         MutAnyOrigin,
         address_space = AddressSpace.SHARED,
-        alignment=128,
-    ].stack_allocation()
+        alignment=256,
+    ]((smem_ptr + b0_off).bitcast[Scalar[BF16]]())
     var B_s1 = LayoutTensor[
         BF16,
         b_smem_layout,
         MutAnyOrigin,
         address_space = AddressSpace.SHARED,
-        alignment=128,
-    ].stack_allocation()
+        alignment=256,
+    ]((smem_ptr + b1_off).bitcast[Scalar[BF16]]())
 
-    comptime num_m_mmas = BM // WGMMA_M
+    # Packed MXFP4 staging buffers: [BN * (BK/32) blocks] * 16 bytes.
+    var B_pack0 = smem_ptr + pack0_off
+    var B_pack1 = smem_ptr + pack1_off
+    var B_scale0 = smem_ptr + scale0_off
+    var B_scale1 = smem_ptr + scale1_off
+
+    var w_blocks_u8 = w_blocks_ptr.address_space_cast[
+        AddressSpace.GLOBAL
+    ]().bitcast[Scalar[U8]]()
+    var B_pack0_u64 = (
+        B_pack0.bitcast[Scalar[U64]]()
+        .address_space_cast[AddressSpace.SHARED]()
+        .mut_cast[True]()
+    )
+    var B_pack1_u64 = (
+        B_pack1.bitcast[Scalar[U64]]()
+        .address_space_cast[AddressSpace.SHARED]()
+        .mut_cast[True]()
+    )
+
+    comptime num_m_mmas_total = BM // WGMMA_M
+    comptime num_m_mmas = num_m_mmas_total // NUM_WARP_GROUPS
     comptime num_n_mmas = BN // WGMMA_N
     comptime c_frag_size = (WGMMA_M * WGMMA_N) // 128
 
@@ -1080,10 +1259,38 @@ fn moe_w2_mxfp4_scatter_wgmma[
         transpose_b=True,
     ]()
 
-    comptime blocks_per_tile = BK // VALUES_PER_BLOCK
     comptime a_chunks = BK // 4
 
     # Preload first K tile into buffer 0.
+    var kb0 = 0
+    for idx in range(
+        Int(thread_idx.x),
+        BN * blocks_per_tile,
+        Int(block_dim.x),
+    ):
+        var c = idx // blocks_per_tile
+        var block_in_tile = idx - c * blocks_per_tile
+        var col = n0 + c
+        var kb = kb0 + block_in_tile
+
+        if col < D and kb < Kblocks:
+            var scale_exp = w_scales_ptr[((expert_id * D + col) * Kblocks) + kb]
+            B_scale0[idx] = scale_exp
+            var packed_base = (((expert_id * D + col) * Kblocks) + kb) * (
+                BYTES_PER_BLOCK
+            )
+            async_copy[16](
+                w_blocks_u8 + packed_base,
+                B_pack0 + idx * BYTES_PER_BLOCK,
+            )
+        else:
+            B_scale0[idx] = 0
+            var base_u64 = idx * 2
+            B_pack0_u64.store[alignment=8](base_u64 + 0, Scalar[U64](0))
+            B_pack0_u64.store[alignment=8](base_u64 + 1, Scalar[U64](0))
+
+    async_copy_commit_group()
+
     for idx in range(Int(thread_idx.x), BM * a_chunks, Int(block_dim.x)):
         var r = idx // a_chunks
         var chunk = idx - r * a_chunks
@@ -1109,7 +1316,8 @@ fn moe_w2_mxfp4_scatter_wgmma[
                 else:
                     A_s0[r, kk + i] = 0
 
-    var kb0 = 0
+    async_copy_wait_all()
+
     for idx in range(
         Int(thread_idx.x),
         BN * blocks_per_tile,
@@ -1117,47 +1325,34 @@ fn moe_w2_mxfp4_scatter_wgmma[
     ):
         var c = idx // blocks_per_tile
         var block_in_tile = idx - c * blocks_per_tile
-        var col = n0 + c
-        var kb = kb0 + block_in_tile
+        var scale = e8m0_to_f32(B_scale0[idx])
 
-        if col < D and kb < Kblocks:
-            var scale_exp = w_scales_ptr[((expert_id * D + col) * Kblocks) + kb]
-            var packed_base = (
-                ((expert_id * D + col) * Kblocks) + kb
-            ) * BYTES_PER_BLOCK
+        var base_u64 = idx * 2
+        var packed0 = bitcast[DType.uint8, 8](
+            UInt64(B_pack0_u64.load[alignment=8](base_u64 + 0))
+        )
+        var packed1 = bitcast[DType.uint8, 8](
+            UInt64(B_pack0_u64.load[alignment=8](base_u64 + 1))
+        )
 
-            var packed_ptr64 = rebind[UnsafePointer[UInt64, MutAnyOrigin]](
-                w_blocks_ptr + packed_base
+        @parameter
+        for byte_in_block in range(8):
+            var r0 = block_in_tile * VALUES_PER_BLOCK + byte_in_block * 2
+            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                packed0[byte_in_block], scale
             )
-            var packed0 = bitcast[DType.uint8, 8](packed_ptr64[0])
-            var packed1 = bitcast[DType.uint8, 8](packed_ptr64[1])
-            var scale = e8m0_to_f32(scale_exp)
+            B_s0[c, r0 + 0] = v2[0]
+            B_s0[c, r0 + 1] = v2[1]
 
-            @parameter
-            for byte_in_block in range(8):
-                var r0 = block_in_tile * VALUES_PER_BLOCK + byte_in_block * 2
-                var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                    packed0[byte_in_block], scale
-                )
-                B_s0[c, r0 + 0] = v2[0]
-                B_s0[c, r0 + 1] = v2[1]
-
-            @parameter
-            for byte_in_block in range(8):
-                var byte = byte_in_block + 8
-                var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
-                var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                    packed1[byte_in_block], scale
-                )
-                B_s0[c, r0 + 0] = v2[0]
-                B_s0[c, r0 + 1] = v2[1]
-        else:
-
-            @parameter
-            for byte_in_block in range(BYTES_PER_BLOCK):
-                var r0 = block_in_tile * VALUES_PER_BLOCK + byte_in_block * 2
-                B_s0[c, r0 + 0] = 0
-                B_s0[c, r0 + 1] = 0
+        @parameter
+        for byte_in_block in range(8):
+            var byte = byte_in_block + 8
+            var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
+            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                packed1[byte_in_block], scale
+            )
+            B_s0[c, r0 + 0] = v2[0]
+            B_s0[c, r0 + 1] = v2[1]
     barrier()
 
     var num_k_tiles = ceildiv(I, BK)
@@ -1167,12 +1362,18 @@ fn moe_w2_mxfp4_scatter_wgmma[
         warpgroup_fence(c_reg_tile)
         wgmma.arrive()
         if use_buf0:
-            wgmma.wgmma(
-                a_smem_tile=A_s0, b_smem_tile=B_s0, c_reg_tile=c_reg_tile
+            wgmma.wgmma[num_warp_groups=NUM_WARP_GROUPS](
+                a_smem_tile=A_s0,
+                b_smem_tile=B_s0,
+                c_reg_tile=c_reg_tile,
+                wg_idx=wg_idx,
             )
         else:
-            wgmma.wgmma(
-                a_smem_tile=A_s1, b_smem_tile=B_s1, c_reg_tile=c_reg_tile
+            wgmma.wgmma[num_warp_groups=NUM_WARP_GROUPS](
+                a_smem_tile=A_s1,
+                b_smem_tile=B_s1,
+                c_reg_tile=c_reg_tile,
+                wg_idx=wg_idx,
             )
         wgmma.commit_group()
         warpgroup_fence(c_reg_tile)
@@ -1185,6 +1386,40 @@ fn moe_w2_mxfp4_scatter_wgmma[
 
             if use_buf0:
                 # Load next tile into buffer 1.
+                for idx in range(
+                    Int(thread_idx.x),
+                    BN * blocks_per_tile,
+                    Int(block_dim.x),
+                ):
+                    var c = idx // blocks_per_tile
+                    var block_in_tile = idx - c * blocks_per_tile
+                    var col = n0 + c
+                    var kb = kb0_next + block_in_tile
+
+                    if col < D and kb < Kblocks:
+                        var scale_exp = w_scales_ptr[
+                            ((expert_id * D + col) * Kblocks) + kb
+                        ]
+                        B_scale1[idx] = scale_exp
+                        var packed_base = (
+                            (expert_id * D + col) * Kblocks + kb
+                        ) * BYTES_PER_BLOCK
+                        async_copy[16](
+                            w_blocks_u8 + packed_base,
+                            B_pack1 + idx * BYTES_PER_BLOCK,
+                        )
+                    else:
+                        B_scale1[idx] = 0
+                        var base_u64 = idx * 2
+                        B_pack1_u64.store[alignment=8](
+                            base_u64 + 0, Scalar[U64](0)
+                        )
+                        B_pack1_u64.store[alignment=8](
+                            base_u64 + 1, Scalar[U64](0)
+                        )
+
+                async_copy_commit_group()
+
                 for idx in range(
                     Int(thread_idx.x), BM * a_chunks, Int(block_dim.x)
                 ):
@@ -1220,6 +1455,47 @@ fn moe_w2_mxfp4_scatter_wgmma[
                             else:
                                 A_s1[r, kk + i] = 0
 
+                async_copy_wait_all()
+
+                for idx in range(
+                    Int(thread_idx.x),
+                    BN * blocks_per_tile,
+                    Int(block_dim.x),
+                ):
+                    var c = idx // blocks_per_tile
+                    var block_in_tile = idx - c * blocks_per_tile
+                    var scale = e8m0_to_f32(B_scale1[idx])
+
+                    var base_u64 = idx * 2
+                    var packed0 = bitcast[DType.uint8, 8](
+                        UInt64(B_pack1_u64.load[alignment=8](base_u64 + 0))
+                    )
+                    var packed1 = bitcast[DType.uint8, 8](
+                        UInt64(B_pack1_u64.load[alignment=8](base_u64 + 1))
+                    )
+
+                    @parameter
+                    for byte_in_block in range(8):
+                        var r0 = (
+                            block_in_tile * VALUES_PER_BLOCK + byte_in_block * 2
+                        )
+                        var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                            packed0[byte_in_block], scale
+                        )
+                        B_s1[c, r0 + 0] = v2[0]
+                        B_s1[c, r0 + 1] = v2[1]
+
+                    @parameter
+                    for byte_in_block in range(8):
+                        var byte = byte_in_block + 8
+                        var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
+                        var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                            packed1[byte_in_block], scale
+                        )
+                        B_s1[c, r0 + 0] = v2[0]
+                        B_s1[c, r0 + 1] = v2[1]
+            else:
+                # Load next tile into buffer 0.
                 for idx in range(
                     Int(thread_idx.x),
                     BN * blocks_per_tile,
@@ -1234,50 +1510,26 @@ fn moe_w2_mxfp4_scatter_wgmma[
                         var scale_exp = w_scales_ptr[
                             ((expert_id * D + col) * Kblocks) + kb
                         ]
+                        B_scale0[idx] = scale_exp
                         var packed_base = (
                             (expert_id * D + col) * Kblocks + kb
                         ) * BYTES_PER_BLOCK
-
-                        var packed_ptr64 = rebind[
-                            UnsafePointer[UInt64, MutAnyOrigin]
-                        ](w_blocks_ptr + packed_base)
-                        var packed0 = bitcast[DType.uint8, 8](packed_ptr64[0])
-                        var packed1 = bitcast[DType.uint8, 8](packed_ptr64[1])
-                        var scale = e8m0_to_f32(scale_exp)
-
-                        @parameter
-                        for byte_in_block in range(8):
-                            var r0 = (
-                                block_in_tile * VALUES_PER_BLOCK
-                                + byte_in_block * 2
-                            )
-                            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                                packed0[byte_in_block], scale
-                            )
-                            B_s1[c, r0 + 0] = v2[0]
-                            B_s1[c, r0 + 1] = v2[1]
-
-                        @parameter
-                        for byte_in_block in range(8):
-                            var byte = byte_in_block + 8
-                            var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
-                            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                                packed1[byte_in_block], scale
-                            )
-                            B_s1[c, r0 + 0] = v2[0]
-                            B_s1[c, r0 + 1] = v2[1]
+                        async_copy[16](
+                            w_blocks_u8 + packed_base,
+                            B_pack0 + idx * BYTES_PER_BLOCK,
+                        )
                     else:
+                        B_scale0[idx] = 0
+                        var base_u64 = idx * 2
+                        B_pack0_u64.store[alignment=8](
+                            base_u64 + 0, Scalar[U64](0)
+                        )
+                        B_pack0_u64.store[alignment=8](
+                            base_u64 + 1, Scalar[U64](0)
+                        )
 
-                        @parameter
-                        for byte_in_block in range(BYTES_PER_BLOCK):
-                            var r0 = (
-                                block_in_tile * VALUES_PER_BLOCK
-                                + byte_in_block * 2
-                            )
-                            B_s1[c, r0 + 0] = 0
-                            B_s1[c, r0 + 1] = 0
-            else:
-                # Load next tile into buffer 0.
+                async_copy_commit_group()
+
                 for idx in range(
                     Int(thread_idx.x), BM * a_chunks, Int(block_dim.x)
                 ):
@@ -1313,6 +1565,8 @@ fn moe_w2_mxfp4_scatter_wgmma[
                             else:
                                 A_s0[r, kk + i] = 0
 
+                async_copy_wait_all()
+
                 for idx in range(
                     Int(thread_idx.x),
                     BN * blocks_per_tile,
@@ -1320,55 +1574,36 @@ fn moe_w2_mxfp4_scatter_wgmma[
                 ):
                     var c = idx // blocks_per_tile
                     var block_in_tile = idx - c * blocks_per_tile
-                    var col = n0 + c
-                    var kb = kb0_next + block_in_tile
+                    var scale = e8m0_to_f32(B_scale0[idx])
 
-                    if col < D and kb < Kblocks:
-                        var scale_exp = w_scales_ptr[
-                            ((expert_id * D + col) * Kblocks) + kb
-                        ]
-                        var packed_base = (
-                            (expert_id * D + col) * Kblocks + kb
-                        ) * BYTES_PER_BLOCK
+                    var base_u64 = idx * 2
+                    var packed0 = bitcast[DType.uint8, 8](
+                        UInt64(B_pack0_u64.load[alignment=8](base_u64 + 0))
+                    )
+                    var packed1 = bitcast[DType.uint8, 8](
+                        UInt64(B_pack0_u64.load[alignment=8](base_u64 + 1))
+                    )
 
-                        var packed_ptr64 = rebind[
-                            UnsafePointer[UInt64, MutAnyOrigin]
-                        ](w_blocks_ptr + packed_base)
-                        var packed0 = bitcast[DType.uint8, 8](packed_ptr64[0])
-                        var packed1 = bitcast[DType.uint8, 8](packed_ptr64[1])
-                        var scale = e8m0_to_f32(scale_exp)
+                    @parameter
+                    for byte_in_block in range(8):
+                        var r0 = (
+                            block_in_tile * VALUES_PER_BLOCK + byte_in_block * 2
+                        )
+                        var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                            packed0[byte_in_block], scale
+                        )
+                        B_s0[c, r0 + 0] = v2[0]
+                        B_s0[c, r0 + 1] = v2[1]
 
-                        @parameter
-                        for byte_in_block in range(8):
-                            var r0 = (
-                                block_in_tile * VALUES_PER_BLOCK
-                                + byte_in_block * 2
-                            )
-                            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                                packed0[byte_in_block], scale
-                            )
-                            B_s0[c, r0 + 0] = v2[0]
-                            B_s0[c, r0 + 1] = v2[1]
-
-                        @parameter
-                        for byte_in_block in range(8):
-                            var byte = byte_in_block + 8
-                            var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
-                            var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
-                                packed1[byte_in_block], scale
-                            )
-                            B_s0[c, r0 + 0] = v2[0]
-                            B_s0[c, r0 + 1] = v2[1]
-                    else:
-
-                        @parameter
-                        for byte_in_block in range(BYTES_PER_BLOCK):
-                            var r0 = (
-                                block_in_tile * VALUES_PER_BLOCK
-                                + byte_in_block * 2
-                            )
-                            B_s0[c, r0 + 0] = 0
-                            B_s0[c, r0 + 1] = 0
+                    @parameter
+                    for byte_in_block in range(8):
+                        var byte = byte_in_block + 8
+                        var r0 = block_in_tile * VALUES_PER_BLOCK + byte * 2
+                        var v2 = decode_mxfp4_byte_to_2xbf16_scaled(
+                            packed1[byte_in_block], scale
+                        )
+                        B_s0[c, r0 + 0] = v2[0]
+                        B_s0[c, r0 + 1] = v2[1]
 
             barrier()
 
@@ -1397,7 +1632,10 @@ fn moe_w2_mxfp4_scatter_wgmma[
             for r_it in range(row_iters):
                 var row_in_warp = lane_row + r_it * 8
                 var row_in_cta = (
-                    m_mma * WGMMA_M + Int(warp_id()) * warp_rows + row_in_warp
+                    wg_idx * (num_m_mmas * WGMMA_M)
+                    + m_mma * WGMMA_M
+                    + warp_in_wg * warp_rows
+                    + row_in_warp
                 )
                 var global_row = row0 + row_in_cta
                 if global_row >= seg_end or global_row >= P:
@@ -1466,8 +1704,8 @@ struct MXFP4MoEW1SwiGlu:
         if P == 0 or num_active_experts_i == 0 or max_tokens_i == 0:
             return
 
-        var grid_x = ceildiv(I, 32)  # BN_ACT = 32
-        var grid_y = ceildiv(max_tokens_i, 64)  # BM = 64
+        var grid_x = ceildiv(I, 64)  # BN_ACT = 64 (BN_RAW = 128)
+        var grid_y = ceildiv(max_tokens_i, 128)  # BM = 128
         var grid_z = num_active_experts_i
 
         var gpu_ctx = ctx.get_device_context()
@@ -1507,13 +1745,29 @@ struct MXFP4MoEW1SwiGlu:
         )
 
         comptime w1_kernel = moe_w1_mxfp4_swiglu_wgmma[
-            BM=64,
-            BN_RAW=64,
+            BM=128,
+            BN_RAW=128,
             BK=64,
             WGMMA_M=64,
-            WGMMA_N=64,
+            WGMMA_N=128,
             WGMMA_K=16,
+            NUM_WARP_GROUPS=2,
         ]
+        comptime a_smem_layout = tile_layout_k_major[BF16, 128, 64]()
+        comptime b_smem_layout = tile_layout_k_major[BF16, 128, 64]()
+        comptime a_bytes = a_smem_layout.size() * 2
+        comptime b_bytes = b_smem_layout.size() * 2
+        comptime a1_off = ((a_bytes + 255) // 256) * 256
+        comptime b0_off = ((a1_off + a_bytes + 255) // 256) * 256
+        comptime b1_off = ((b0_off + b_bytes + 255) // 256) * 256
+        comptime blocks_per_tile = 64 // VALUES_PER_BLOCK
+        comptime pack_bytes = 128 * blocks_per_tile * BYTES_PER_BLOCK
+        comptime scale_bytes = 128 * blocks_per_tile
+        comptime pack0_off = ((b1_off + b_bytes + 255) // 256) * 256
+        comptime pack1_off = ((pack0_off + pack_bytes + 255) // 256) * 256
+        comptime scale0_off = ((pack1_off + pack_bytes + 255) // 256) * 256
+        comptime scale1_off = ((scale0_off + scale_bytes + 255) // 256) * 256
+        comptime smem_use = scale1_off + scale_bytes
         gpu_ctx.enqueue_function_checked[w1_kernel, w1_kernel](
             x_dev,
             T,
@@ -1533,7 +1787,11 @@ struct MXFP4MoEW1SwiGlu:
             Scalar[F32](alpha),
             Scalar[F32](limit),
             grid_dim=(grid_x, grid_y, grid_z),
-            block_dim=(128, 1, 1),
+            block_dim=(256, 1, 1),
+            shared_mem_bytes=Int(smem_use),
+            func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+                smem_use
+            ),
         )
 
 
@@ -1570,8 +1828,8 @@ struct MXFP4MoEW2Scatter:
         var num_experts = w_blocks.dim_size(0)
         var kblocks = w_blocks.dim_size(2)
 
-        var grid_x = ceildiv(D, 64)  # BN = 64
-        var grid_y = ceildiv(max_tokens_i, 64)  # BM = 64
+        var grid_x = ceildiv(D, 128)  # BN = 128
+        var grid_y = ceildiv(max_tokens_i, 128)  # BM = 128
         var grid_z = num_active_experts_i
 
         var gpu_ctx = ctx.get_device_context()
@@ -1623,13 +1881,29 @@ struct MXFP4MoEW2Scatter:
             return
 
         comptime w2_kernel = moe_w2_mxfp4_scatter_wgmma[
-            BM=64,
-            BN=64,
+            BM=128,
+            BN=128,
             BK=64,
             WGMMA_M=64,
-            WGMMA_N=64,
+            WGMMA_N=128,
             WGMMA_K=16,
+            NUM_WARP_GROUPS=2,
         ]
+        comptime a_smem_layout = tile_layout_k_major[BF16, 128, 64]()
+        comptime b_smem_layout = tile_layout_k_major[BF16, 128, 64]()
+        comptime a_bytes = a_smem_layout.size() * 2
+        comptime b_bytes = b_smem_layout.size() * 2
+        comptime a1_off = ((a_bytes + 255) // 256) * 256
+        comptime b0_off = ((a1_off + a_bytes + 255) // 256) * 256
+        comptime b1_off = ((b0_off + b_bytes + 255) // 256) * 256
+        comptime blocks_per_tile = 64 // VALUES_PER_BLOCK
+        comptime pack_bytes = 128 * blocks_per_tile * BYTES_PER_BLOCK
+        comptime scale_bytes = 128 * blocks_per_tile
+        comptime pack0_off = ((b1_off + b_bytes + 255) // 256) * 256
+        comptime pack1_off = ((pack0_off + pack_bytes + 255) // 256) * 256
+        comptime scale0_off = ((pack1_off + pack_bytes + 255) // 256) * 256
+        comptime scale1_off = ((scale0_off + scale_bytes + 255) // 256) * 256
+        comptime smem_use = scale1_off + scale_bytes
         gpu_ctx.enqueue_function_checked[w2_kernel, w2_kernel](
             h_sorted_dev,
             P,
@@ -1647,5 +1921,9 @@ struct MXFP4MoEW2Scatter:
             T,
             D,
             grid_dim=(grid_x, grid_y, grid_z),
-            block_dim=(128, 1, 1),
+            block_dim=(256, 1, 1),
+            shared_mem_bytes=Int(smem_use),
+            func_attribute=FuncAttribute.MAX_DYNAMIC_SHARED_SIZE_BYTES(
+                smem_use
+            ),
         )
