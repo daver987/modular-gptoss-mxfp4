@@ -217,7 +217,7 @@ Evidence from pre-flight (historical):
       - `y`: `[T, D]` `float32` (sums TOPK rows per token: `y[t] = sum_k y_pairs[t*TOPK+k]`)
 
 Internal kernel notes (implementation detail; not part of the Python contract):
-- `examples/custom_ops/kernels/moe_mxfp4_ops.mojo` WGMMA kernels currently launch with `block_dim=(256,1,1)` (2 warpgroups) and tile params `BM=128`, `BN=128`/`BN_RAW=128`, `BK=64`, `wgmma_shape=(64,128,16)`, `NUM_WARP_GROUPS=2`.
+- `examples/custom_ops/kernels/moe_mxfp4_ops.mojo` WGMMA kernels launch with `block_dim=(256,1,1)` (2 warpgroups) and tile params `BM=128`, `BN=128`/`BN_RAW=128`, `BK=64`, `wgmma_shape=(64,128,16)`, `NUM_WARP_GROUPS=2`. Host launch uses a small heuristic: `grid_y=1` for tiny `P` else `grid_y=2`, and `grid_z=min(num_experts, P)` to avoid launching inactive experts on decode/small batches.
 - A/B BF16 tiles and packed staging buffers (`B_pack{0,1}`) are in dynamic shared memory; packed `w_blocks` are staged via `gpu.memory.async_copy` and decoded to BF16 in shared immediately before WGMMA (host launch sets `shared_mem_bytes`); `w_scales` scale bytes are loaded directly and kept in registers during decode.
 - Note on “full fusion”: a naïve fused W1→SwiGLU→W2 kernel would recompute W1 activations for each W2 output tile (N-tiling), so true fusion likely needs a different mapping (e.g., cluster/DSM reuse) and should be approached after closing simpler bandwidth gaps.
 

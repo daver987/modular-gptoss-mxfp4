@@ -1776,8 +1776,16 @@ struct MXFP4MoEW1SwiGlu:
             return
 
         var grid_x = ceildiv(I, 64)  # BN_ACT = 64 (BN_RAW = 128)
+        # Tune launch geometry without CPU sync:
+        # - For tiny P (decode/small batches), launching all experts dominates overhead.
+        #   We can cap grid_z by P since `num_active_experts <= P` for TOPK routing.
+        # - For small P, extra Y blocks are pure overhead (they immediately return).
         var grid_y = 2
+        if P <= 128:
+            grid_y = 1
         var grid_z = num_experts
+        if grid_z > P:
+            grid_z = P
 
         var gpu_ctx = ctx.get_device_context()
 
@@ -1901,7 +1909,11 @@ struct MXFP4MoEW2Scatter:
 
         var grid_x = ceildiv(D, 128)  # BN = 128
         var grid_y = 2
+        if P <= 128:
+            grid_y = 1
         var grid_z = num_experts
+        if grid_z > P:
+            grid_z = P
 
         var gpu_ctx = ctx.get_device_context()
 
@@ -2034,7 +2046,11 @@ struct MXFP4MoEW2Pairs:
 
         var grid_x = ceildiv(D, 128)  # BN = 128
         var grid_y = 2
+        if P <= 128:
+            grid_y = 1
         var grid_z = w_blocks.dim_size(0)
+        if grid_z > P:
+            grid_z = P
 
         var gpu_ctx = ctx.get_device_context()
 
@@ -2165,7 +2181,11 @@ struct MXFP4MoEW2PairsBF16:
 
         var grid_x = ceildiv(D, 128)  # BN = 128
         var grid_y = 2
+        if P <= 128:
+            grid_y = 1
         var grid_z = w_blocks.dim_size(0)
+        if grid_z > P:
+            grid_z = P
 
         var gpu_ctx = ctx.get_device_context()
 
